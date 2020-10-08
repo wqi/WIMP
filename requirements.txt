@@ -1,0 +1,10 @@
+pytorch-lightning >= 0.9.0
+torch >= 1.5.0
+torchvision
+shapely
+numpy
+scipy
+pandas
+tqdm
+h5py
+matplotlib
