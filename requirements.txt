@@ -8,3 +8,4 @@ pandas
 tqdm
 h5py
 matplotlib
+parmap
