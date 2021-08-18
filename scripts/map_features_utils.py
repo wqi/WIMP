@@ -13,7 +13,7 @@ from argoverse.utils.centerline_utils import (
     remove_overlapping_lane_seq,
 )
 from argoverse.utils.mpl_plotting_utils import visualize_centerline
-
+import json
 
 class MapFeaturesUtils:
     """Utils for computation of map-based features."""
@@ -25,9 +25,9 @@ class MapFeaturesUtils:
         self._MAX_SEARCH_RADIUS_CENTERLINES = 50.0
         self._MAX_CENTERLINE_CANDIDATES_TEST = 6
 
-    def get_point_in_polygon_score(self, lane_seq: List[int],
-                                   xy_seq: np.ndarray, city_name: str,
-                                   avm: ArgoverseMap) -> int:
+    def get_point_in_polygon_score(self, lane_seq,
+                                   xy_seq, map_json,
+                                   avm) -> int:
         """Get the number of coordinates that lie insde the lane seq polygon.
 
         Args:
@@ -40,21 +40,21 @@ class MapFeaturesUtils:
             lane sequence
         """
         lane_seq_polygon = cascaded_union([
-            Polygon(avm.get_lane_segment_polygon(lane, city_name)).buffer(0)
+            Polygon(map_json.get_lane_segment_polygon(lane)).buffer(0)
             for lane in lane_seq
         ])
         point_in_polygon_score = 0
-        for xy in xy_seq:
+        for xy in xy_seq:        
             point_in_polygon_score += lane_seq_polygon.contains(Point(xy))
         return point_in_polygon_score
 
     def sort_lanes_based_on_point_in_polygon_score(
             self,
-            lane_seqs: List[List[int]],
-            xy_seq: np.ndarray,
-            city_name: str,
-            avm: ArgoverseMap,
-    ) -> List[List[int]]:
+            lane_seqs,
+            xy_seq,
+            map_json,
+            avm,
+    ):
         """Filter lane_seqs based on the number of coordinates inside the bounding polygon of lanes.
 
         Args:
@@ -69,7 +69,7 @@ class MapFeaturesUtils:
         point_in_polygon_scores = []
         for lane_seq in lane_seqs:
             point_in_polygon_scores.append(
-                self.get_point_in_polygon_score(lane_seq, xy_seq, city_name,
+                self.get_point_in_polygon_score(lane_seq, xy_seq, map_json,
                                                 avm))
         randomized_tiebreaker = np.random.random(len(point_in_polygon_scores))
         sorted_point_in_polygon_scores_idx = np.lexsort(
@@ -85,13 +85,13 @@ class MapFeaturesUtils:
 
     def get_heuristic_centerlines_for_test_set(
             self,
-            lane_seqs: List[List[int]],
-            xy_seq: np.ndarray,
-            city_name: str,
-            avm: ArgoverseMap,
-            max_candidates: int,
-            scores: List[int],
-    ) -> List[np.ndarray]:
+            lane_seqs,
+            xy_seq,
+            map_json,
+            avm,
+            max_candidates,
+            scores,
+    ):
         """Sort based on distance along centerline and return the centerlines.
 
         Args:
@@ -114,7 +114,7 @@ class MapFeaturesUtils:
             lane_seq = lane_seqs[i]
             score = scores[i]
             diverse = True
-            centerline = avm.get_cl_from_lane_seq([lane_seq], city_name)[0]
+            centerline = map_json.get_cl_from_lane_seq([lane_seq])[0]
             if aligned_cl_count < int(max_candidates / 2):
                 start_dist = LineString(centerline).project(Point(xy_seq[0]))
                 end_dist = LineString(centerline).project(Point(xy_seq[-1]))
@@ -151,9 +151,9 @@ class MapFeaturesUtils:
 
     def get_candidate_centerlines_for_trajectory(
             self,
-            xy: np.ndarray,
-            city_name: str,
-            avm: ArgoverseMap,
+            xy,
+            map_json,
+            avm,
             viz: bool = False,
             max_search_radius: float = 50.0,
             seq_len: int = 50,
@@ -182,15 +182,15 @@ class MapFeaturesUtils:
 
         """
         # Get all lane candidates within a bubble
-        curr_lane_candidates = avm.get_lane_ids_in_xy_bbox(
-            xy[-1, 0], xy[-1, 1], city_name, self._MANHATTAN_THRESHOLD)
+        curr_lane_candidates = map_json.get_lane_ids_in_xy_bbox(
+            xy[-1, 0], xy[-1, 1], self._MANHATTAN_THRESHOLD)
 
         # Keep expanding the bubble until at least 1 lane is found
         while (len(curr_lane_candidates) < 1
                and self._MANHATTAN_THRESHOLD < max_search_radius):
             self._MANHATTAN_THRESHOLD *= 2
-            curr_lane_candidates = avm.get_lane_ids_in_xy_bbox(
-                xy[-1, 0], xy[-1, 1], city_name, self._MANHATTAN_THRESHOLD)
+            curr_lane_candidates = map_json.get_lane_ids_in_xy_bbox(
+                xy[-1, 0], xy[-1, 1], self._MANHATTAN_THRESHOLD)
 
         assert len(curr_lane_candidates) > 0, "No nearby lanes found!!"
 
@@ -199,11 +199,11 @@ class MapFeaturesUtils:
         dfs_threshold_back = 150.0
 
         # DFS to get all successor and predecessor candidates
-        obs_pred_lanes: List[Sequence[int]] = [] # NOQA
+        obs_pred_lanes = [] # NOQA
         for lane in curr_lane_candidates:
-            candidates_future = avm.dfs(lane, city_name, 0,
+            candidates_future = map_json.dfs(lane, 0,
                                         dfs_threshold_front)
-            candidates_past = avm.dfs(lane, city_name, 0, dfs_threshold_back,
+            candidates_past = map_json.dfs(lane, 0, dfs_threshold_back,
                                       True)
 
             # Merge past and future
@@ -216,18 +216,18 @@ class MapFeaturesUtils:
 
         # Removing overlapping lanes
         obs_pred_lanes = remove_overlapping_lane_seq(obs_pred_lanes)
-
+        
         # Sort lanes based on point in polygon score
         obs_pred_lanes, scores = self.sort_lanes_based_on_point_in_polygon_score(
-            obs_pred_lanes, xy, city_name, avm)
+            obs_pred_lanes, xy, map_json, avm)
 
         # If the best centerline is not along the direction of travel, re-sort
         if mode == "test":
             candidate_centerlines = self.get_heuristic_centerlines_for_test_set(
-                obs_pred_lanes, xy, city_name, avm, max_candidates, scores)
+                obs_pred_lanes, xy, map_json, avm, max_candidates, scores)
         else:
-            candidate_centerlines = avm.get_cl_from_lane_seq(
-                [obs_pred_lanes[0]], city_name)
+            candidate_centerlines = map_json.get_cl_from_lane_seq(
+                [obs_pred_lanes[0]])
 
         if viz:
             plt.figure(0, figsize=(8, 7))

@@ -6,7 +6,8 @@ import pandas as pd
 import parmap
 import pickle as pkl
 import warnings
-
+from scenario_serialization import load_argoverse_scenario_hdf5, load_static_map_json
+import sys
 from argoverse.map_representation.map_api import ArgoverseMap
 from argoverse.utils.centerline_utils import (
     filter_candidate_centerlines,
@@ -21,7 +22,19 @@ from scipy.spatial.distance import cdist
 from shapely.geometry import LineString
 from shapely.affinity import affine_transform, rotate
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union # NOQA
-
+from argoverse.utils.manhattan_search import (
+    compute_polygon_bboxes,
+    find_all_polygon_bboxes_overlapping_query_bbox,
+    find_local_polygons,
+)
+from collections import defaultdict
+from argoverse.utils.centerline_utils import (
+    centerline_to_polygon,
+    filter_candidate_centerlines,
+    get_centerlines_most_aligned_with_trajectory,
+    lane_waypt_to_query_dist,
+    remove_overlapping_lane_seq,
+)
 warnings.simplefilter('ignore', np.RankWarning)
 
 
@@ -149,6 +162,251 @@ class ModifiedArgoverseMap(ArgoverseMap):
         return candidate_centerlines
 
 
+class ScenarioMap:
+    def __init__(self, root):
+        """Initialize the Argoverse Map."""
+        self.root = root
+        self.render_window_radius = 150
+        self.im_scale_factor = 50
+        self.data = load_static_map_json(root)
+        self.city_lane_centerlines_dict, self.predecessors_dict, self.successors_dict = self.build_centerline_index()
+        (
+            self.city_halluc_bbox_table,
+            self.city_halluc_tableidx_to_laneid_map,
+        ) = self.build_hallucinated_lane_bbox_index()
+
+        # get hallucinated lane extends and driveable area from binary img
+        self.city_to_lane_polygons_dict: Mapping[str, np.ndarray] = {}
+        self.city_to_driveable_areas_dict: Mapping[str, np.ndarray] = {}
+        self.city_to_lane_bboxes_dict: Mapping[str, np.ndarray] = {}
+        self.city_to_da_bboxes_dict: Mapping[str, np.ndarray] = {}
+
+        # for city_name in self.city_name_to_city_id_dict.keys():
+        #     lane_polygons = np.array(self.get_vector_map_lane_polygons(city_name), dtype=object)
+        #     driveable_areas = np.array(self.get_vector_map_driveable_areas(city_name), dtype=object)
+        #     lane_bboxes = compute_polygon_bboxes(lane_polygons)
+        #     da_bboxes = compute_polygon_bboxes(driveable_areas)
+
+        #     self.city_to_lane_polygons_dict[city_name] = lane_polygons
+        #     self.city_to_driveable_areas_dict[city_name] = driveable_areas
+        #     self.city_to_lane_bboxes_dict[city_name] = lane_bboxes
+        #     self.city_to_da_bboxes_dict[city_name] = da_bboxes
+
+    def build_centerline_index(self):
+        """
+        Build dictionary of centerline for each city, with lane_id as key
+        Returns:
+            city_lane_centerlines_dict:  Keys are city names, values are dictionaries
+                                        (k=lane_id, v=lane info)
+        """
+        city_lane_centerlines_dict = {}
+        predecessors_dict = defaultdict(list)
+        successors_dict = defaultdict(list)
+        for lane in self.data['lane_segments']:
+            city_lane_centerlines_dict[lane['id']] = lane
+            for x in lane['successors']:
+                successors_dict[lane['id']].append(x)
+                predecessors_dict[x].append(lane['id'])
+        return city_lane_centerlines_dict, predecessors_dict, successors_dict
+    
+    def build_hallucinated_lane_bbox_index(self):
+        """
+        Populate the pre-computed hallucinated extent of each lane polygon, to allow for fast
+        queries.
+        Returns:
+            city_halluc_bbox_table
+            city_id_to_halluc_tableidx_map
+        """
+
+        city_halluc_bbox_table = []
+        city_halluc_tableidx_to_laneid_map = {}
+
+        for lane in self.data['lane_segments']:
+            left_lane_xy_start = np.array([lane['left_lane_boundary']['points'][0]['x'], lane['left_lane_boundary']['points'][0]['y']])
+            left_lane_xy_end = np.array([lane['left_lane_boundary']['points'][-1]['x'], lane['left_lane_boundary']['points'][-1]['y']])
+            right_lane_xy_start = np.array([lane['right_lane_boundary']['points'][0]['x'], lane['right_lane_boundary']['points'][0]['y']])
+            right_lane_xy_end = np.array([lane['right_lane_boundary']['points'][-1]['x'], lane['right_lane_boundary']['points'][-1]['y']])
+            area_1 = np.abs(left_lane_xy_start[0] - right_lane_xy_end[0]) * np.abs(left_lane_xy_start[1] - right_lane_xy_end[1])
+            area_2 = np.abs(right_lane_xy_start[0] - left_lane_xy_end[0]) * np.abs(right_lane_xy_start[1] - left_lane_xy_end[1])
+            city_halluc_tableidx_to_laneid_map[str(len(city_halluc_bbox_table))] = lane['id']
+            if area_1 > area_2:
+                city_halluc_bbox_table.append([left_lane_xy_start[0], left_lane_xy_start[1], right_lane_xy_end[0], right_lane_xy_end[1]])
+            else:
+                city_halluc_bbox_table.append([right_lane_xy_start[0], right_lane_xy_start[1], left_lane_xy_end[0], left_lane_xy_end[1]])
+        city_halluc_bbox_table = np.array(city_halluc_bbox_table)  
+        return city_halluc_bbox_table, city_halluc_tableidx_to_laneid_map
+
+    def get_lane_ids_in_xy_bbox(
+        self,
+        query_x,
+        query_y,
+        query_search_range_manhattan = 5.0,
+    ):
+        """
+        Prune away all lane segments based on Manhattan distance. We vectorize this instead
+        of using a for-loop. Get all lane IDs within a bounding box in the xy plane.
+        This is a approximation of a bubble search for point-to-polygon distance.
+        The bounding boxes of small point clouds (lane centerline waypoints) are precomputed in the map.
+        We then can perform an efficient search based on manhattan distance search radius from a
+        given 2D query point.
+        We pre-assign lane segment IDs to indices inside a big lookup array, with precomputed
+        hallucinated lane polygon extents.
+        Args:
+            query_x: representing x coordinate of xy query location
+            query_y: representing y coordinate of xy query location
+            city_name: either 'MIA' for Miami or 'PIT' for Pittsburgh
+            query_search_range_manhattan: search radius along axes
+        Returns:
+            lane_ids: lane segment IDs that live within a bubble
+        """
+        query_min_x = query_x - query_search_range_manhattan
+        query_max_x = query_x + query_search_range_manhattan
+        query_min_y = query_y - query_search_range_manhattan
+        query_max_y = query_y + query_search_range_manhattan
+
+        overlap_indxs = find_all_polygon_bboxes_overlapping_query_bbox(
+            self.city_halluc_bbox_table,
+            np.array([query_min_x, query_min_y, query_max_x, query_max_y]),
+        )
+
+        if len(overlap_indxs) == 0:
+            return []
+
+        neighborhood_lane_ids: List[int] = []
+        for overlap_idx in overlap_indxs:
+            lane_segment_id = self.city_halluc_tableidx_to_laneid_map[str(overlap_idx)]
+            neighborhood_lane_ids.append(lane_segment_id)
+
+        return neighborhood_lane_ids
+
+    def get_lane_segment_predecessor_ids(self, lane_segment_id):
+        """
+        Get land id for the lane predecessor of the specified lane_segment_id
+        Args:
+            lane_segment_id: unique identifier for a lane segment within a city
+            city_name: either 'MIA' for Miami or 'PIT' for Pittsburgh
+        Returns:
+            predecessor_ids: list of integers, representing lane segment IDs of predecessors
+        """
+        predecessor_ids = self.predecessors_dict[lane_segment_id]
+        return predecessor_ids
+
+    def get_lane_segment_successor_ids(self, lane_segment_id):
+        """
+        Get land id for the lane sucessor of the specified lane_segment_id
+        Args:
+            lane_segment_id: unique identifier for a lane segment within a city
+            city_name: either 'MIA' or 'PIT' for Miami or Pittsburgh
+        Returns:
+            successor_ids: list of integers, representing lane segment IDs of successors
+        """
+        successor_ids = self.successors_dict[lane_segment_id]
+        return successor_ids
+
+    def get_lane_segment_centerline(self, lane_segment_id):
+        """
+        We return a 3D centerline for any particular lane segment.
+        Args:
+            lane_segment_id: unique identifier for a lane segment within a city
+            city_name: either 'MIA' or 'PIT' for Miami or Pittsburgh
+        Returns:
+            lane_centerline: Numpy array of shape (N,3)
+        """
+        try:
+            lane_centerline = np.array([[centerline['x'], centerline['y'], centerline['z']] for centerline in self.city_lane_centerlines_dict[lane_segment_id]['centerline']['points']])
+            return lane_centerline
+        except:
+            return None
+        
+    def get_lane_segment_polygon(self, lane_segment_id: int) -> np.ndarray:
+        """
+        Hallucinate a 3d lane polygon based around the centerline. We rely on the average
+        lane width within our cities to hallucinate the boundaries. We rely upon the
+        rasterized maps to provide heights to points in the xy plane.
+        Args:
+            lane_segment_id: unique identifier for a lane segment within a city
+            city_name: either 'MIA' or 'PIT' for Miami or Pittsburgh
+        Returns:
+            lane_polygon: Array of polygon boundary (K,3), with identical and last boundary points
+        """
+        lane_centerline = self.get_lane_segment_centerline(lane_segment_id)
+        try:
+            lane_polygon = centerline_to_polygon(lane_centerline[:, :2])
+        except:
+            import ipdb; ipdb.set_trace()
+            a = 1
+        return np.hstack([lane_polygon, np.zeros(lane_polygon.shape[0])[:, np.newaxis] + np.mean(lane_centerline[:, 2])])
+
+    def get_cl_from_lane_seq(self, lane_seqs: Iterable[List[int]]) -> List[np.ndarray]:
+        """Get centerlines corresponding to each lane sequence in lane_sequences
+        Args:
+            lane_seqs: Iterable of sequence of lane ids (Eg. [[12345, 12346, 12347], [12345, 12348]])
+            city_name: either 'MIA' for Miami or 'PIT' for Pittsburgh
+        Returns:
+            candidate_cl: list of numpy arrays for centerline corresponding to each lane sequence
+        """
+
+        candidate_cl = []
+        for lanes in lane_seqs:
+            curr_candidate_cl = np.empty((0, 2))
+            for curr_lane in lanes:
+                curr_candidate = self.get_lane_segment_centerline(curr_lane)[:, :2]
+                curr_candidate_cl = np.vstack((curr_candidate_cl, curr_candidate))
+            candidate_cl.append(curr_candidate_cl)
+        return candidate_cl
+
+    def dfs(
+        self,
+        lane_id: int,
+        dist: float = 0,
+        threshold: float = 30,
+        extend_along_predecessor: bool = False,
+    ) -> List[List[int]]:
+        """
+        Perform depth first search over lane graph up to the threshold.
+        Args:
+            lane_id: Starting lane_id (Eg. 12345)
+            city_name
+            dist: Distance of the current path
+            threshold: Threshold after which to stop the search
+            extend_along_predecessor: if true, dfs over predecessors, else successors
+        Returns:
+            lanes_to_return (list of list of integers): List of sequence of lane ids
+                Eg. [[12345, 12346, 12347], [12345, 12348]]
+        """
+        if dist > threshold:
+            return [[lane_id]]
+        else:
+            traversed_lanes = []
+            child_lanes = (
+                self.get_lane_segment_predecessor_ids(lane_id)
+                if extend_along_predecessor
+                else self.get_lane_segment_successor_ids(lane_id)
+            )
+            if child_lanes is not None:
+                for child in child_lanes:
+                    centerline = self.get_lane_segment_centerline(child)
+                    if centerline is not None:
+                        try:
+                            cl_length = LineString(centerline).length
+                            curr_lane_ids = self.dfs(
+                                child,
+                                dist + cl_length,
+                                threshold,
+                                extend_along_predecessor,
+                            )
+                            traversed_lanes.extend(curr_lane_ids)
+                        except:
+                            pass
+
+            if len(traversed_lanes) == 0:
+                return [[lane_id]]
+            lanes_to_return = []
+            for lane_seq in traversed_lanes:
+                lanes_to_return.append(lane_seq + [lane_id] if extend_along_predecessor else [lane_id] + lane_seq)
+            return lanes_to_return
+
+
 def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=True,
                      map_features_flag=True, social_features_flag=True, timesteps=20, avm=None,
                      mfu=None, return_labels=False, label_path="", generate_candidate_centerlines=0,
@@ -234,7 +492,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
             return xy_locations, feature_helpers
         return xy_locations, None
 
-    def compute_map_features(xy_locations, city, timesteps=20, avm=None, mfu=None, rotation=None,
+    def compute_map_features(xy_locations, map_json, timesteps=20, avm=None, mfu=None, rotation=None,
                              translation=None, labels=None, generate_candidate_centerlines=0,
                              compute_all=False):
         """
@@ -326,9 +584,9 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                 avm = ArgoverseMap()
             if mfu is None:
                 mfu = MapFeaturesUtils()
-
+            
             # Get best-fitting (oracle) centerline for current vehicle
-            heuristic_oracle_centerline = mfu.get_candidate_centerlines_for_trajectory(locations, city, avm=avm, viz=False, max_candidates=generate_candidate_centerlines, mode='train')[0] # NOQA
+            heuristic_oracle_centerline = mfu.get_candidate_centerlines_for_trajectory(locations, map_json, avm=avm, viz=False, max_candidates=generate_candidate_centerlines, mode='train')[0] # NOQA
             features = {
                 "HEURISTIC_ORACLE_CENTERLINE" + save_str: heuristic_oracle_centerline,
                 "HEURISTIC_ORACLE_CENTERLINE_NORMALIZED" + save_str: normalize_xy(heuristic_oracle_centerline, translation=translation, rotation=rotation)[0] # NOQA
@@ -337,7 +595,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
             # Get top-fitting candidate centerlines for current vehicle (can beused at test time)
             if compute_all:
                 if generate_candidate_centerlines > 0:
-                    test_candidate_centerlines = mfu.get_candidate_centerlines_for_trajectory(locations, city, avm=avm, viz=False, max_candidates=generate_candidate_centerlines, mode='test') # NOQA
+                    test_candidate_centerlines = mfu.get_candidate_centerlines_for_trajectory(locations, map_json, avm=avm, viz=False, max_candidates=generate_candidate_centerlines, mode='test') # NOQA
                     features["TEST_CANDIDATE_CENTERLINES" + save_str] = test_candidate_centerlines
 
                 # Apply rotation and translation normalization if specified
@@ -365,7 +623,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                                                     generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
                                                     compute_all=compute_all)
             map_features.update(map_full_features)
-
+        
         # Compute extra map features if specified
         if args.extra_map_features:
             rotated_and_translated_partial_trajectory = normalize_xy(xy_partial_trajectory,
@@ -402,17 +660,14 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                         map_features.update(extra_features_label_partial)
         return map_features
 
-    def compute_social_features(data, city, timesteps=20, avm=None, mfu=None, rotation=None,
+    def compute_social_features(social_agents, map_json, timesteps=20, avm=None, mfu=None, rotation=None,
                                 translation=None, generate_candidate_centerlines=0):
-        social_agents = data[data["OBJECT_TYPE"] != "AGENT"]
         social_features_all = []
-        tmap = {tstamp: num for num, tstamp in enumerate(data['TIMESTAMP'].unique())}
-        for track_id in social_agents['TRACK_ID'].unique():
+        for track_id, social_agent in social_agents.items():
             social_features = OrderedDict([])
-            social_agent = social_agents[social_agents['TRACK_ID'] == track_id]
-            xy_locations = social_agent[['X', 'Y']].values
-            tstamps = np.array([tmap[t] for t in social_agent['TIMESTAMP'].values])
-
+            xy_locations = np.array([state.position for state in agent_track.object_states])
+            tstamps = np.array([state.timestep for state in agent_track.object_states])
+           
             # Remove actors that appear after first 2 seconds
             if tstamps[0] < timesteps:
                 # Remove trajectories that are too small
@@ -449,7 +704,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                     if map_features_flag:
                         if xy_features_normalize_flag:
                             map_features = compute_map_features(xy_locations=xy_locations,
-                                                                city=city, timesteps=tsteps,
+                                                                map_json=map_json, timesteps=tsteps,
                                                                 avm=avm, mfu=mfu, rotation=rotation,
                                                                 translation=translation,
                                                                 labels=labels,
@@ -457,7 +712,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                                                                 compute_all=False)
                         else:
                             map_features = compute_map_features(xy_locations=xy_locations,
-                                                                city=city, timesteps=tsteps,
+                                                                map_json=map_json, timesteps=tsteps,
                                                                 avm=avm, mfu=mfu, labels=labels,
                                                                 generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
                                                                 compute_all=False)
@@ -468,17 +723,19 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
     '''
     Compute features for current data sequence
     '''
-    data = pd.read_csv(path, dtype={"TIMESTAMP": str})
+    data = load_argoverse_scenario_hdf5(path)
+    map_json = ScenarioMap(path.replace(".h5", "_map.json"))
     final_features = OrderedDict([])
-
     seq_id = path.split('/')[-1].split('.')[0]
     final_features['PATH'] = os.path.abspath(path)
-    final_features['CITY_NAME'] = data['CITY_NAME'].values[0]
-    final_features['SEQ_ID'] = seq_id
+    final_features['MAP_PATH'] = os.path.abspath(path.replace(".h5", "_map.json"))
+    final_features['SEQ_ID'] = data.scenario_id
 
+    all_tracks = {x.track_id: x for x in data.tracks}
+    
     # Get focal agent track
-    agent_track = data[data["OBJECT_TYPE"] == "AGENT"]
-    xy_locations = agent_track[['X', 'Y']].values
+    agent_track = all_tracks[data.focal_track_id]
+    xy_locations = np.array([state.position for state in agent_track.object_states])
     agent_features = {}
 
     # Get labels
@@ -492,7 +749,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
             labels = label_agent_track[['X', 'Y']].values
             final_features["LABELS_PATH"] = os.path.abspath(label_path)
         agent_features['LABELS_UNNORMALIZED'] = labels
-
+    
     # Get XY input features
     if xy_features_flag:
         xy_features, xy_feature_helpers = compute_xy_features(xy_locations=xy_locations[:timesteps, :], # NOQA
@@ -506,7 +763,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
     if map_features_flag:
         if xy_features_normalize_flag:
             map_features = compute_map_features(xy_locations=xy_locations,
-                                                city=final_features['CITY_NAME'],
+                                                map_json=map_json,
                                                 timesteps=timesteps, avm=avm, mfu=mfu,
                                                 rotation=xy_feature_helpers['ROTATION'],
                                                 translation=xy_feature_helpers['TRANSLATION'],
@@ -515,7 +772,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                                                 compute_all=compute_all)
         else:
             map_features = compute_map_features(xy_locations=xy_locations,
-                                                city=final_features['CITY_NAME'],
+                                                map_json=map_json,
                                                 timesteps=timesteps, avm=avm, mfu=mfu,
                                                 labels=labels,
                                                 generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
@@ -525,13 +782,13 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
     # Compute social features
     if social_features_flag:
         if xy_features_normalize_flag:
-            social_features = compute_social_features(data=data, city=final_features['CITY_NAME'],
+            social_features = compute_social_features(social_agents={x:y for x,y in all_tracks.items() if x!=data.focal_track_id}, map_json=map_json,
                                                       timesteps=timesteps, avm=avm, mfu=mfu,
                                                       rotation=xy_feature_helpers['ROTATION'],
                                                       translation=xy_feature_helpers['TRANSLATION'],
                                                       generate_candidate_centerlines=generate_candidate_centerlines) # NOQA
         else:
-            social_features = compute_social_features(data=data, city=final_features['CITY_NAME'],
+            social_features = compute_social_features(social_agents={x:y for x,y in all_tracks.items() if x!=data.focal_track_id}, map_json=map_json,
                                                       timesteps=timesteps, avm=avm, mfu=mfu,
                                                       generate_candidate_centerlines=generate_candidate_centerlines) # NOQA
         final_features['SOCIAL'] = social_features
@@ -638,14 +895,15 @@ def compute_features_iterator(path, save_dir, xy_features_flag=True,
         label_path = ""
         if args.mode == 'test' and args.test_labels_path != "":
             label_path = os.path.join(args.test_labels_path, file)
-        input_param = {'path': file_path, 'xy_features_flag': xy_features_flag,
-                       'xy_features_normalize_flag': xy_features_normalize_flag,
-                       'map_features_flag': map_features_flag,
-                       'social_features_flag': social_features_flag, 'avm': avm, 'mfu': mfu,
-                       'timesteps': timesteps, 'return_labels': return_labels,
-                       'label_path': label_path,
-                       'generate_candidate_centerlines': generate_candidate_centerlines,
-                       'compute_all': compute_all}
+        if '.h5' in file_path:
+            input_param = {'path': file_path, 'xy_features_flag': xy_features_flag,
+                        'xy_features_normalize_flag': xy_features_normalize_flag,
+                        'map_features_flag': map_features_flag,
+                        'social_features_flag': social_features_flag, 'avm': avm, 'mfu': mfu,
+                        'timesteps': timesteps, 'return_labels': return_labels,
+                        'label_path': label_path,
+                        'generate_candidate_centerlines': generate_candidate_centerlines,
+                        'compute_all': compute_all}
         input_params.append(input_param)
 
     _ = parmap.map(compute_features_wrapper, input_params, pm_pbar=True,
