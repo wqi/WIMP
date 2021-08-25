@@ -174,7 +174,6 @@ class ArgoverseDataset(Dataset):
         if self.social_features_flag:
             social = defaultdict(list)
             data['SOCIAL'].sort(key=lambda x: x['XY_FEATURES'].shape[0], reverse=True)
-            print ([x['XY_FEATURES'].shape[0] for x in data['SOCIAL']])
             for social_num, social_features in enumerate(data['SOCIAL']):
                 if social_num >= self.max_social_agents:
                     break

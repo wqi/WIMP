@@ -73,7 +73,7 @@ def add_experimental_args(parent_parser):
     parser.add_argument('--distributed-backend', default=None, help='Trainer backend')
     parser.add_argument('--num-nodes', default=1, type=int, help='Number of nodes used')
     parser.add_argument('--precision', default=32, type=int, help='Precision employed in weights')
-    parser.add_argument('--resume-from-checkpoint', help='Path to checkpoint to resume training from')
+    parser.add_argument('--resume-from-checkpoint', default='', help='Path to checkpoint to resume training from')
 
     # Logging Params
     parser.add_argument('--resume-from-checkpoint-legacy', default='', help='Path to checkpoint to resume training from')
@@ -103,14 +103,14 @@ def cli_main(args):
     resume_from_checkpoint = None
     if os.path.isfile(args.checkpoint_dir + '/last.ckpt'):
         resume_from_checkpoint = args.checkpoint_dir + '/last.ckpt'
-        print ("LOADING:", resume_from_checkpoint)
+        print ("LOADING 1:", resume_from_checkpoint)
     if args.resume_from_checkpoint != '':
         resume_from_checkpoint = args.resume_from_checkpoint
-        print ("LOADING:", resume_from_checkpoint)
+        print ("LOADING 2:", resume_from_checkpoint)
     if args.resume_from_checkpoint_legacy != '':
         checkpoint = torch.load(args.resume_from_checkpoint_legacy)
         model.load_state_dict(checkpoint['state_dict'])
-        print ("LOADING:", args.resume_from_checkpoint_legacy)
+        print ("LOADING 3:", args.resume_from_checkpoint_legacy)
     # Initialize trainer
     logger = TensorBoardLogger(args.checkpoint_dir, name='experiments', version=args.experiment_name)
     early_stop_cb = EarlyStopping(patience=args.early_stop_threshold, verbose=True, monitor='val/loss')
