@@ -26,9 +26,9 @@ class ArgoverseDataset(Dataset):
             timesteps (int): Timesteps for which feature computation needs to be done (10 timesteps = 1 second)
             filtered_idxs (list[int]): Specific idxs from dataframe to use in dataloader
     """
-    def __init__(self, data_loc, mode='train', transform=None, delta=True, timesteps=20,
-                 outsteps=30, augment_data=False, map_features_flag=True, social_features_flag=True,
-                 heuristic=False, ifc=True, is_oracle=False):
+    def __init__(self, data_loc, mode='train', transform=None, delta=True, timesteps=50,
+                 outsteps=60, augment_data=False, map_features_flag=True, social_features_flag=True,
+                 heuristic=False, ifc=True, is_oracle=False, filter_data=False):
         self.data_loc = data_loc
         self.transform = transform
         self.mode = mode
@@ -38,12 +38,22 @@ class ArgoverseDataset(Dataset):
         self.timesteps = timesteps
         self.outsteps = outsteps
         self.is_oracle = is_oracle
+        self.filter_data = filter_data
 
         if mode == 'trainval':
             self.sequences = [os.path.join("{}/{}".format(data_loc, 'train'), file) for file in os.listdir("{}/{}".format(data_loc, 'train'))]
             self.sequences = self.sequences + [os.path.join("{}/{}".format(data_loc, 'val'), file) for file in os.listdir("{}/{}".format(data_loc, 'val'))]
         else:
             self.sequences = [os.path.join("{}/{}".format(data_loc, mode), file) for file in os.listdir("{}/{}".format(data_loc, mode))]
+            if self.filter_data:
+                filter_idx = {x:1 for x in pickle.load(open("{}/keep_ids/{}_seq_ids.pkl".format(data_loc, mode), "rb"))}
+                filtered_sequences = []
+                for file_name in self.sequences:
+                    if file_name.split("/")[-1].split(".")[0] in filter_idx:
+                        filtered_sequences.append(file_name)
+                assert(len(filtered_sequences) == len(filter_idx.keys()))
+                self.sequences = filtered_sequences[:]
+                print ("Number of Files:", len(self.sequences))
         # self.sequences = self.sequences[:100] # TEMP
         self.delta = delta
         self.delta_str = "_delta" if self.delta else ""
@@ -68,7 +78,7 @@ class ArgoverseDataset(Dataset):
             data = pickle.load(inFile)
 
         example['seq_id'] = data['SEQ_ID']
-        example['city'] = data['CITY_NAME']
+        example['city'] = "argoverse-2.0"
         # Get feature helpers
         if 'TRANSLATION' in data:
             example['translation'] = np.array(data['TRANSLATION'])
@@ -77,9 +87,11 @@ class ArgoverseDataset(Dataset):
 
         # Get focal agent features
         example['agent_xy_features'] = data['AGENT']['XY_FEATURES']
+        no_label = False
         if 'LABELS' in data['AGENT']:
             example['agent_xy_labels'] = data['AGENT']['LABELS']
         else:
+            no_label = True
             example['agent_xy_labels'] = np.zeros((self.outsteps, 2), dtype=np.float)
 
         agent_str = '_FULL' if self.is_oracle else '_PARTIAL'
@@ -88,7 +100,17 @@ class ArgoverseDataset(Dataset):
         if not self.is_oracle:
             example['agent_oracle_centerline'] = data['AGENT'][self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+agent_str]
             example['agent_oracle_centerline_lengths'] = example['agent_oracle_centerline'].shape[0]
-
+            agent_tstamps = data['AGENT']['TSTAMPS']
+            # Compute mask for agents that don't have information for all timesteps
+            agent_mask = np.full(self.timesteps + self.outsteps, False)
+            agent_mask[agent_tstamps] = True
+            agent_input_mask = agent_mask[:self.timesteps]
+            agent_label_mask = agent_mask[self.timesteps:]
+            example['agent_input_mask'] = agent_input_mask
+            if not no_label:
+                example['agent_label_mask'] = agent_label_mask
+            else:
+                example['agent_label_mask'] = (agent_label_mask * 0) == 1
             # Add noise
             if self.mode == 'train':
                 rotation_sign = 1.0 if np.random.binomial(1, 0.5) == 1 else -1.0
@@ -98,8 +120,21 @@ class ArgoverseDataset(Dataset):
                 agent_all_features = np.vstack([example['agent_xy_features'], example['agent_xy_labels']])
                 agent_all_features = self.add_noise(agent_all_features, rotation=rotation, translation=translation)
                 example['agent_xy_features'] = agent_all_features[:example['agent_xy_features'].shape[0],:]
-                example['agent_xy_labels'] = agent_all_features[example['agent_xy_features'].shape[0]:,:]
-                example['agent_oracle_centerline'] = self.add_noise(example['agent_oracle_centerline'], rotation=rotation, translation=translation)
+                example['agent_xy_labels'] = agent_all_features[example['agent_xy_features'].shape[0]:,:]  
+                try:
+                    example['agent_oracle_centerline'] = self.add_noise(example['agent_oracle_centerline'], rotation=rotation, translation=translation)
+                except:
+                    pass
+            agent_padded_xy = np.zeros((self.timesteps, 2), dtype=np.float)
+            agent_padded_labels = np.zeros((self.outsteps, 2), dtype=np.float)
+            agent_padded_xy[agent_input_mask] = example['agent_xy_features']
+            agent_padded_labels[agent_label_mask] = example['agent_xy_labels']
+            example['agent_xy_features'] = agent_padded_xy[:,:]
+            example['agent_xy_labels'] = agent_padded_labels[:,:]
+            # if example['agent_xy_labels'].shape[0] < self.outsteps:
+            #     example['agent_xy_labels'] = np.pad(example['agent_xy_labels'], ((0, self.outsteps - example['agent_xy_labels'].shape[0]), (0,0)))
+            # if example['agent_xy_features'].shape[0] < self.timesteps:
+            #     example['agent_xy_features'] = np.pad(example['agent_xy_features'], ((0, self.timesteps - example['agent_xy_features'].shape[0]), (0,0)))
         else:
 
             example['agent_oracle_centerline'] = data['AGENT']['TEST_CANDIDATE_CENTERLINE_NORMALIZED'+agent_str]
@@ -116,7 +151,7 @@ class ArgoverseDataset(Dataset):
                 example['agent_xy_features'] = agent_all_features[:example['agent_xy_features'].shape[0],:]
                 example['agent_xy_labels'] = agent_all_features[example['agent_xy_features'].shape[0]:,:]
                 example['agent_oracle_centerline'] = [self.add_noise(x, rotation=rotation, translation=translation) for x in example['agent_oracle_centerline']]
-
+                
             # Pad centerlines
             # max_pad = np.max(example['agent_oracle_centerline_lengths'])
             # for index, elem in enumerate(example['agent_oracle_centerline']):
@@ -143,7 +178,7 @@ class ArgoverseDataset(Dataset):
                     break
                 tstamps = social_features['TSTAMPS']
                 # Check if social agent has 2 seconds of history
-                if social_features['XY_FEATURES'].shape[0] == self.timesteps:
+                if social_features['XY_FEATURES'].shape[0] <= self.timesteps:
 
                     # Compute mask for agents that don't have information for all timesteps
                     mask = np.full(self.timesteps + self.outsteps, False)
@@ -185,12 +220,16 @@ class ArgoverseDataset(Dataset):
                     # Get centerline for IFC
 
                     if self.mode == 'train':
-                        social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str] = self.add_noise(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str], rotation=rotation, translation=translation)
+                        try:
+                            social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str] = self.add_noise(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str], rotation=rotation, translation=translation)
+                        except:
+                            pass
                     social['social_oracle_centerline'].append(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str])
                     social['social_oracle_centerline_lengths'].append(social_features[self.heuristic_str + 'ORACLE_CENTERLINE_NORMALIZED'+social_str].shape[0])              
                     num_social_agents += 1
 
         # Pad centerlines
+
         social_max_pad = np.max(social['social_oracle_centerline_lengths'])
         if social_max_pad < np.max(example['agent_oracle_centerline_lengths']):
             social_max_pad = np.max(example['agent_oracle_centerline_lengths'])
@@ -238,7 +277,6 @@ class ArgoverseDataset(Dataset):
         indexer = np.arange(num_social_agents + 1)
         adjacency[:, indexer, indexer] = 0
         label_adjacency[:, indexer, indexer] = 0
-
         example['adjacency'] = adjacency
         example['label_adjacency'] = label_adjacency
 
@@ -281,6 +319,9 @@ class ArgoverseDataset(Dataset):
         ifc_helpers['translation'] = example['translation']
         ifc_helpers['city'] = example['city']
         ifc_helpers['idx'] = example['seq_id']
+        ifc_helpers['agent_input_mask'] = example['agent_input_mask']
+        ifc_helpers['social_input_mask'] = example['social_input_mask']
+        ifc_helpers['agent_label_mask'] = example['agent_label_mask']
 
         if self.delta:
             ifc_helpers['agent_xy_delta'] = example['agent_xy_ref_end'].astype(np.float32)

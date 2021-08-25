@@ -67,6 +67,7 @@ def parse_arguments():
     parser.add_argument('--chunk-length', type=int, default=-1, help='Chunk length')
     parser.add_argument('--num-cpus', type=int, default=os.cpu_count(),
                         help='Number of cpus to use')
+    parser.add_argument('--full-trajectory-polyline', action='store_true', help='Compute polyline using full trajectory')
     args = parser.parse_args()
     return args
 
@@ -318,7 +319,7 @@ class ScenarioMap:
         except:
             return None
         
-    def get_lane_segment_polygon(self, lane_segment_id: int) -> np.ndarray:
+    def get_lane_segment_polygon(self, lane_segment_id: int, eps=1.0) -> np.ndarray:
         """
         Hallucinate a 3d lane polygon based around the centerline. We rely on the average
         lane width within our cities to hallucinate the boundaries. We rely upon the
@@ -330,11 +331,7 @@ class ScenarioMap:
             lane_polygon: Array of polygon boundary (K,3), with identical and last boundary points
         """
         lane_centerline = self.get_lane_segment_centerline(lane_segment_id)
-        try:
-            lane_polygon = centerline_to_polygon(lane_centerline[:, :2])
-        except:
-            import ipdb; ipdb.set_trace()
-            a = 1
+        lane_polygon = centerline_to_polygon(lane_centerline[:, :2])
         return np.hstack([lane_polygon, np.zeros(lane_polygon.shape[0])[:, np.newaxis] + np.mean(lane_centerline[:, 2])])
 
     def get_cl_from_lane_seq(self, lane_seqs: Iterable[List[int]]) -> List[np.ndarray]:
@@ -616,13 +613,14 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
         map_features.update(map_partial_features)
 
         # Compute polyline-based map features considering 5 seconds
-        if labels is not None:
-            xy_full_trajectory = np.concatenate([xy_locations[:timesteps, :], labels], axis=0)
-            map_full_features = map_features_helper(xy_full_trajectory, save_str="_FULL", avm=avm,
-                                                    rotation=rotation, translation=translation,
-                                                    generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
-                                                    compute_all=compute_all)
-            map_features.update(map_full_features)
+        if args.full_trajectory_polyline:
+            if labels is not None:
+                xy_full_trajectory = np.concatenate([xy_locations[:timesteps, :], labels], axis=0)
+                map_full_features = map_features_helper(xy_full_trajectory, save_str="_FULL", avm=avm,
+                                                        rotation=rotation, translation=translation,
+                                                        generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
+                                                        compute_all=compute_all)
+                map_features.update(map_full_features)
         
         # Compute extra map features if specified
         if args.extra_map_features:
@@ -665,8 +663,8 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
         social_features_all = []
         for track_id, social_agent in social_agents.items():
             social_features = OrderedDict([])
-            xy_locations = np.array([state.position for state in agent_track.object_states])
-            tstamps = np.array([state.timestep for state in agent_track.object_states])
+            xy_locations = np.array([state.position for state in social_agent.object_states])
+            tstamps = np.array([state.timestep for state in social_agent.object_states])
            
             # Remove actors that appear after first 2 seconds
             if tstamps[0] < timesteps:
@@ -724,25 +722,32 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
     Compute features for current data sequence
     '''
     data = load_argoverse_scenario_hdf5(path)
+    # data = load_argoverse_scenario_hdf5('/scratch/hdd001/home/skhandel/AVForecasting/Argoverse-2.0/CONFIDENTIAL_Forecasting_Dataset/test/31c99ad8-456a-4db4-ace0-00579269dfa0.h5')
     map_json = ScenarioMap(path.replace(".h5", "_map.json"))
     final_features = OrderedDict([])
     seq_id = path.split('/')[-1].split('.')[0]
     final_features['PATH'] = os.path.abspath(path)
     final_features['MAP_PATH'] = os.path.abspath(path.replace(".h5", "_map.json"))
     final_features['SEQ_ID'] = data.scenario_id
-
-    all_tracks = {x.track_id: x for x in data.tracks}
-    
+    valid_object_types = ['vehicle', 'bus', 'motorcyclist']
+    all_tracks = {x.track_id: x for x in data.tracks if x.object_type in valid_object_types}
     # Get focal agent track
-    agent_track = all_tracks[data.focal_track_id]
+    try:
+        agent_track = all_tracks[data.focal_track_id]
+    except:
+        print ("Error: ", path, data.focal_track_id, all_tracks.keys())
+        return None
     xy_locations = np.array([state.position for state in agent_track.object_states])
+    agent_tstamps = np.array([state.timestep for state in agent_track.object_states])
+    agent_tsteps = np.sum(agent_tstamps < timesteps)
     agent_features = {}
-
+    if agent_tsteps < timesteps:
+        print ("Not 50+60: ", path, data.focal_track_id, all_tracks.keys())
     # Get labels
     labels = None
     if return_labels:
         if label_path == "":
-            labels = xy_locations[timesteps:, :]
+            labels = xy_locations[agent_tsteps:, :]
         else:
             label_data = pd.read_csv(label_path, dtype={"TIMESTAMP": str})
             label_agent_track = label_data[label_data["OBJECT_TYPE"] == "AGENT"]
@@ -752,10 +757,11 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
     
     # Get XY input features
     if xy_features_flag:
-        xy_features, xy_feature_helpers = compute_xy_features(xy_locations=xy_locations[:timesteps, :], # NOQA
+        xy_features, xy_feature_helpers = compute_xy_features(xy_locations=xy_locations[:agent_tsteps, :], # NOQA
                                                               normalize=xy_features_normalize_flag,
-                                                              timesteps=timesteps)
+                                                              timesteps=agent_tsteps)
         agent_features['XY_FEATURES'] = xy_features
+        agent_features['TSTAMPS'] = agent_tstamps
         if xy_feature_helpers is not None:
             final_features.update(xy_feature_helpers)
 
@@ -764,7 +770,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
         if xy_features_normalize_flag:
             map_features = compute_map_features(xy_locations=xy_locations,
                                                 map_json=map_json,
-                                                timesteps=timesteps, avm=avm, mfu=mfu,
+                                                timesteps=agent_tsteps, avm=avm, mfu=mfu,
                                                 rotation=xy_feature_helpers['ROTATION'],
                                                 translation=xy_feature_helpers['TRANSLATION'],
                                                 labels=labels,
@@ -773,7 +779,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
         else:
             map_features = compute_map_features(xy_locations=xy_locations,
                                                 map_json=map_json,
-                                                timesteps=timesteps, avm=avm, mfu=mfu,
+                                                timesteps=agent_tsteps, avm=avm, mfu=mfu,
                                                 labels=labels,
                                                 generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
                                                 compute_all=compute_all)
@@ -802,6 +808,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
 
     if bool(agent_features):
         final_features['AGENT'] = agent_features
+
     return final_features
 
 
@@ -835,16 +842,14 @@ def compute_features_wrapper(kwargs):
     """
     # Compute features specified by args
     features = compute_features(**kwargs)
+    if features is not None:
+        # Cast np arrays in feature dict to f32 to save disk space
+        features = cast_dict_f32(features, {})
+        # Dump computed features to disk
+        with open("{}/{}/{}.pkl".format(args.save_dir, args.mode, kwargs['path'].split('/')[-1].split('.')[0]), 'wb') as outFile:
+            pkl.dump(features, outFile, -1)
 
-    # Cast np arrays in feature dict to f32 to save disk space
-    features = cast_dict_f32(features, {})
-
-    # Dump computed features to disk
-    with open("{}/{}/{}.pkl".format(args.save_dir, args.mode,
-              kwargs['path'].split('/')[-1].split('.')[0]), 'wb') as outFile:
-        pkl.dump(features, outFile, -1)
-
-    # Guard against memory leaks by explicitly deleting features
+        # Guard against memory leaks by explicitly deleting features
     del features
 
 
@@ -884,9 +889,9 @@ def compute_features_iterator(path, save_dir, xy_features_flag=True,
     avm = ArgoverseMap()
     mfu = MapFeaturesUtils()
 
-    if args.mode == 'test':
-        if args.test_labels_path == "":
-            return_labels = False
+    # if args.mode == 'test':
+    #     if args.test_labels_path == "":
+    #         return_labels = False
 
     # Iterate over all files
     input_params = []
@@ -896,6 +901,8 @@ def compute_features_iterator(path, save_dir, xy_features_flag=True,
         if args.mode == 'test' and args.test_labels_path != "":
             label_path = os.path.join(args.test_labels_path, file)
         if '.h5' in file_path:
+            # if not os.path.isfile('/h/skhandel/Forecasting/argoverse-2.0/argoverse-processed/test/{}'.format(file.replace(".h5",".pkl"))):
+            #     import ipdb; ipdb.set_trace()
             input_param = {'path': file_path, 'xy_features_flag': xy_features_flag,
                         'xy_features_normalize_flag': xy_features_normalize_flag,
                         'map_features_flag': map_features_flag,
@@ -904,13 +911,20 @@ def compute_features_iterator(path, save_dir, xy_features_flag=True,
                         'label_path': label_path,
                         'generate_candidate_centerlines': generate_candidate_centerlines,
                         'compute_all': compute_all}
-        input_params.append(input_param)
-
+            # compute_features_wrapper(input_param)
+            input_params.append(input_param)
+    # import ipdb; ipdb.set_trace()
     _ = parmap.map(compute_features_wrapper, input_params, pm_pbar=True,
                    pm_processes=args.num_cpus)
 
 
 if __name__ == '__main__':
+    # data = load_argoverse_scenario_hdf5('/scratch/hdd001/home/skhandel/AVForecasting/Argoverse-2.0/CONFIDENTIAL_Forecasting_Dataset/train/c569021c-b7a6-479b-b166-220a42542b52.h5')
+    # valid_object_types = ['vehicle', 'bus', 'motorcyclist']
+    # all_tracks = {x.track_id: x for x in data.tracks}
+    # print (all_tracks[data.focal_track_id].object_type)
+    # import ipdb; ipdb.set_trace()
+
     args = parse_arguments()
     print(args)
     compute_features_iterator("{}/{}".format(args.dataroot, args.mode), save_dir=args.save_dir,

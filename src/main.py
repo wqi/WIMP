@@ -2,14 +2,17 @@ import json
 import os
 import torch
 import pytorch_lightning as pl
+import sys
+sys.path.insert(0, '../../')
+sys.path.insert(0, '../')
 
 from argparse import ArgumentParser
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
-
-from src.data.argoverse_datamodule import ArgoverseDataModule
-from src.data.dummy_datamodule import DummyDataModule
-from src.models.WIMP import WIMP
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from data.argoverse_datamodule import ArgoverseDataModule
+from data.dummy_datamodule import DummyDataModule
+from models.WIMP import WIMP
 
 
 def parse_arguments():
@@ -64,7 +67,7 @@ def add_experimental_args(parent_parser):
 
     # Trainer Params
     parser.add_argument("--gpus", type=int, default=1, help='# of GPUs to use for training')
-    parser.add_argument("--check-val-every-n-epoch", type=int, default=3, help="# of training epochs between val") # NOQA
+    parser.add_argument("--check-val-every-n-epoch", type=int, default=1, help="# of training epochs between val") # NOQA
     parser.add_argument("--max-epochs", type=int, default=120, help="Max # of training epochs")
     parser.add_argument("--early-stop-threshold", type=int, default=5, help="Number of consecutive val epochs without improvement before termination") # NOQA
     parser.add_argument('--distributed-backend', default=None, help='Trainer backend')
@@ -73,8 +76,13 @@ def add_experimental_args(parent_parser):
     parser.add_argument('--resume-from-checkpoint', help='Path to checkpoint to resume training from')
 
     # Logging Params
+    parser.add_argument('--resume-from-checkpoint-legacy', default='', help='Path to checkpoint to resume training from')
+    parser.add_argument('--checkpoint-dir', type=str, default=os.getcwd(), help='Path to save files')
+    parser.add_argument("--v0-multi-test", action='store_true', help='Test v0 on multi-agent dataset')
+    # Logging Params
     parser.add_argument('--experiment-name', type=str, help='Save file prefix')
-
+    parser.add_argument('--logs-root', type=str, default=os.getcwd() + '/experiments', help='Path to save logs')
+    
     return parser
 
 
@@ -91,14 +99,28 @@ def cli_main(args):
     if args.model_name == 'WIMP':
         model = WIMP(args)
 
+     # Initialize trainer
+    resume_from_checkpoint = None
+    if os.path.isfile(args.checkpoint_dir + '/last.ckpt'):
+        resume_from_checkpoint = args.checkpoint_dir + '/last.ckpt'
+        print ("LOADING:", resume_from_checkpoint)
+    if args.resume_from_checkpoint != '':
+        resume_from_checkpoint = args.resume_from_checkpoint
+        print ("LOADING:", resume_from_checkpoint)
+    if args.resume_from_checkpoint_legacy != '':
+        checkpoint = torch.load(args.resume_from_checkpoint_legacy)
+        model.load_state_dict(checkpoint['state_dict'])
+        print ("LOADING:", args.resume_from_checkpoint_legacy)
     # Initialize trainer
-    logger = TensorBoardLogger(os.getcwd(), name='experiments', version=args.experiment_name)
-    early_stop_cb = EarlyStopping(patience=args.early_stop_threshold, verbose=True)
+    logger = TensorBoardLogger(args.checkpoint_dir, name='experiments', version=args.experiment_name)
+    early_stop_cb = EarlyStopping(patience=args.early_stop_threshold, verbose=True, monitor='val/loss')
+    checkpoint_callback = ModelCheckpoint(monitor='val/loss', save_top_k=3, mode='min', save_last=True, period=1,
+                                          filepath=args.checkpoint_dir + '/checkpoint-{epoch:02d}-{val_loss:.2f}')
     trainer = pl.Trainer(gpus=args.gpus, check_val_every_n_epoch=args.check_val_every_n_epoch,
-                         max_epochs=args.max_epochs, default_root_dir=os.getcwd(),
+                         max_epochs=args.max_epochs, default_root_dir=args.logs_root,
                          distributed_backend=args.distributed_backend, num_nodes=args.num_nodes,
-                         precision=args.precision, resume_from_checkpoint=args.resume_from_checkpoint,
-                         logger=logger, callbacks=[early_stop_cb])
+                         precision=args.precision, resume_from_checkpoint=resume_from_checkpoint,
+                         logger=logger, callbacks=[early_stop_cb], checkpoint_callback=checkpoint_callback, gradient_clip_val=(5.0 if args.gradient_clipping else 0.0))
     trainer.fit(model, dm)
 
 

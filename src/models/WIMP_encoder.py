@@ -48,10 +48,10 @@ class WIMPEncoder(nn.Module):
         if self.hparams.batch_norm:
             self.input_bn = nn.BatchNorm1d(self.hparams.hidden_dim)
 
-    def forward(self, agent_features, social_features, num_agent_mask, ifc_helpers=None, visualize_centerline=False):
+    def forward(self, agent_features, social_features, num_agent_mask, adjacency, ifc_helpers=None, visualize_centerline=False):
         non_zero_indices = torch.nonzero(num_agent_mask.view(-1,), as_tuple=True)[0]
         zero_indices = torch.nonzero(num_agent_mask.view(-1,) == 0, as_tuple=True)[0]
-
+    
         if self.hparams.use_centerline_features:
             agent_centerline = ifc_helpers['agent_oracle_centerline']
             agent_centerline_lengths = ifc_helpers['agent_oracle_centerline_lengths']
@@ -79,7 +79,9 @@ class WIMPEncoder(nn.Module):
             self.lstm.flatten_parameters()
 
         all_agents = torch.cat([agent_features.unsqueeze(1), social_features], dim=1).view(-1, *agent_features.size()[1:])
+        all_input_mask = torch.cat([ifc_helpers['agent_input_mask'].unsqueeze(1), ifc_helpers['social_input_mask']], dim=1).view(-1, *ifc_helpers['agent_input_mask'].size()[1:])
         all_agents_nonzero = all_agents.index_select(0, non_zero_indices)
+        all_input_mask_nonzero = all_input_mask.index_select(0, non_zero_indices)
         _ , resorter = torch.sort(torch.cat([non_zero_indices, zero_indices], dim=0), descending=False)
         all_agents_nonzero_transposed = all_agents_nonzero.transpose(1,2).contiguous()
 
@@ -92,7 +94,7 @@ class WIMPEncoder(nn.Module):
         input_features = input_features.transpose(1,2).contiguous()
         if self.hparams.batch_norm:
             input_features = self.input_bn(input_features.transpose(1,2).contiguous()).transpose(1,2).contiguous()
-
+        input_features = input_features * all_input_mask_nonzero.unsqueeze(-1)
         # Initialize Hidden State
         hidden = self.initHidden(self.hparams.num_layers, input_features.size(0))
         if visualize_centerline:

@@ -41,7 +41,7 @@ class MapFeaturesUtils:
         """
         lane_seq_polygon = cascaded_union([
             Polygon(map_json.get_lane_segment_polygon(lane)).buffer(0)
-            for lane in lane_seq
+            for lane in lane_seq if len(map_json.get_lane_segment_centerline(lane)) > 1
         ])
         point_in_polygon_score = 0
         for xy in xy_seq:        
@@ -191,9 +191,22 @@ class MapFeaturesUtils:
             self._MANHATTAN_THRESHOLD *= 2
             curr_lane_candidates = map_json.get_lane_ids_in_xy_bbox(
                 xy[-1, 0], xy[-1, 1], self._MANHATTAN_THRESHOLD)
-
-        assert len(curr_lane_candidates) > 0, "No nearby lanes found!!"
-
+        try:
+            assert len(curr_lane_candidates) > 0, "No nearby lanes found!!"
+        except:
+            while (len(curr_lane_candidates) < 1
+                and self._MANHATTAN_THRESHOLD < max_search_radius*100):
+                self._MANHATTAN_THRESHOLD *= 2
+                curr_lane_candidates = map_json.get_lane_ids_in_xy_bbox(
+                    xy[-1, 0], xy[-1, 1], self._MANHATTAN_THRESHOLD)
+            try:
+                assert (len(curr_lane_candidates) > 0)
+            except:
+                while (len(curr_lane_candidates) < 1 and self._MANHATTAN_THRESHOLD < max_search_radius*500):
+                    self._MANHATTAN_THRESHOLD *= 2
+                    curr_lane_candidates = map_json.get_lane_ids_in_xy_bbox(
+                        xy[-1, 0], xy[-1, 1], self._MANHATTAN_THRESHOLD)
+        assert (len(curr_lane_candidates) > 0)
         # Set dfs threshold
         dfs_threshold_front = 150.0
         dfs_threshold_back = 150.0
@@ -213,7 +226,6 @@ class MapFeaturesUtils:
                         past_lane_seq[-1] == future_lane_seq[0]
                     ), "Incorrect DFS for candidate lanes past and future"
                     obs_pred_lanes.append(past_lane_seq + future_lane_seq[1:])
-
         # Removing overlapping lanes
         obs_pred_lanes = remove_overlapping_lane_seq(obs_pred_lanes)
         

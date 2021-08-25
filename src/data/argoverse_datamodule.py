@@ -3,7 +3,7 @@ import pytorch_lightning as pl
 
 from torch.utils.data import DataLoader, Dataset
 
-from src.data.argoverse_dataset import ArgoverseDataset
+from data.argoverse_dataset import ArgoverseDataset
 
 
 class ArgoverseDataModule(pl.LightningDataModule):
@@ -26,7 +26,7 @@ class ArgoverseDataModule(pl.LightningDataModule):
         ds = ArgoverseDataset(self.cfg.dataroot, mode=mode, delta=self.cfg.predict_delta,
                               map_features_flag=self.cfg.map_features,
                               social_features_flag=True, heuristic=(not self.cfg.no_heuristic),
-                              ifc=self.cfg.IFC, is_oracle=self.cfg.use_oracle)
+                              ifc=self.cfg.IFC, is_oracle=self.cfg.use_oracle, filter_data=self.cfg.filter_data)
 
         shuffle = False if mode == 'val' or mode == 'test' else True
         drop_last = shuffle

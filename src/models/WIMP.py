@@ -54,7 +54,7 @@ class WIMP(pl.LightningModule):
         parser.add_argument("--gradient-clipping", action='store_true', help="Enable gradient clipping")
         parser.add_argument("--scheduler-step-size", nargs='+', type=int, default=[30, 60, 90, 120, 150])
         parser.add_argument("--wta", action='store_true', help="Use Winner Takes All approach")
-
+        parser.add_argument("--filter-data", action='store_true', help="Filter data based on 50+60")
         return parser
 
     def __init__(self, hparams, hidden_dim=128):
@@ -67,13 +67,13 @@ class WIMP(pl.LightningModule):
                                        self.hparams.dropout)
         self.decoder = WIMPDecoder(self.hparams)
 
-    def forward(self, agent_features, social_features, adjacency, num_agent_mask, outsteps=30,
+    def forward(self, agent_features, social_features, adjacency, num_agent_mask, outsteps=60,
                 social_label_features=None, label_adjacency=None, classmate_forcing=True,
                 labels=None, ifc_helpers=None, test=False, map_estimate=False,
                 gt=None, idx=None, sample_next=False, num_predictions=1, am=None):
         # Encode agent and social features
         encoding, hidden, waypoint_predictions = self.encoder(agent_features, social_features,
-                                                              num_agent_mask, ifc_helpers)
+                                                              num_agent_mask, adjacency, ifc_helpers)
         waypoint_predictions_tensor_encoder = waypoint_predictions.squeeze(-2).view(
             agent_features.size(0), social_features.size(1) + 1, -1, agent_features.size(2))
 
@@ -111,18 +111,17 @@ class WIMP(pl.LightningModule):
         # Compute predictions
         input_dict, target_dict = batch
         preds, waypoint_preds, all_dist_params = self(**input_dict)
-
+        
         # Compute loss and metrics
-        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds)
+        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds, mask=input_dict['ifc_helpers']['agent_label_mask'])
         agent_mean_ade, agent_mean_fde, agent_mean_mr = metrics
 
         # Log results from training step
-        result = pl.TrainResult(loss)
-        result.log('train/loss', loss, on_epoch=True, sync_dist=True)
-        result.log('train/ade', agent_mean_ade, on_epoch=True, sync_dist=True)
-        result.log('train/fde', agent_mean_fde, on_epoch=True, sync_dist=True)
-        result.log('train/mr', agent_mean_mr, on_epoch=True, sync_dist=True)
-        return result
+        self.log('train/loss', loss, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        self.log('train/ade', agent_mean_ade, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        self.log('train/fde', agent_mean_fde, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        self.log('train/mr', agent_mean_mr, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        return loss
 
     def validation_step(self, batch, batch_idx):
         # Compute predictions
@@ -130,16 +129,14 @@ class WIMP(pl.LightningModule):
         preds, waypoint_preds, all_dist_params = self(**input_dict)
 
         # Compute loss and metrics
-        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds)
+        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds, mask=input_dict['ifc_helpers']['agent_label_mask'])
         agent_mean_ade, agent_mean_fde, agent_mean_mr = metrics
 
         # Log results from validation step
-        result = pl.EvalResult(checkpoint_on=loss, early_stop_on=loss)
-        result.log('val/loss', loss, on_epoch=True, sync_dist=True)
-        result.log('val/ade', agent_mean_ade, on_epoch=True, sync_dist=True)
-        result.log('val/fde', agent_mean_fde, on_epoch=True, sync_dist=True)
-        result.log('val/mr', agent_mean_mr, on_epoch=True, sync_dist=True)
-        return result
+        self.log('val/loss', loss, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        self.log('val/ade', agent_mean_ade, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        self.log('val/fde', agent_mean_fde, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
+        self.log('val/mr', agent_mean_mr, on_epoch=True, sync_dist=True, prog_bar=True, logger=True)
 
     def test_step(self, batch, batch_idx):
         # TODO: Implement generation of leaderboard submission formats
@@ -151,13 +148,13 @@ class WIMP(pl.LightningModule):
                                                          gamma=0.5)
         return [optimizer], [scheduler]
 
-    def eval_preds(self, preds, target_dict, waypoint_preds=None):
+    def eval_preds(self, preds, target_dict, waypoint_preds=None, mask=None):
         # Compute current k value
         k_value_threshold = self.hparams.k_value_threshold
         k_value_index = (self.current_epoch // k_value_threshold)
         if k_value_index >= len(self.hparams.k_values):
             k_value_index = len(self.hparams.k_values) - 1
-        k_value = self.hparams.k_values[k_value_index]
+        k_value = int(self.hparams.k_values[k_value_index])
 
         # Compute loss
         agent_preds = preds.narrow(dim=1, start=0, length=1).squeeze(1)
@@ -167,11 +164,10 @@ class WIMP(pl.LightningModule):
             agent_waypoint_predictions = waypoint_preds[0].narrow(dim=1, start=0, length=1).squeeze(1)
             agent_encoder_waypoint_predictions = waypoint_preds[1].narrow(dim=1, start=0, length=1)
             social_encoder_waypoint_predictions = waypoint_preds[1].narrow(dim=1, start=1, length=waypoint_preds[1].size(1)-1)
-
         if agent_preds.size(-1) == 2:
             agent_loss = self.l1_ewta_loss(agent_preds, target_dict['agent_labels'], k=k_value)
         else:
-            agent_loss = l1_ewta_loss_prob(agent_preds, target_dict['agent_labels'], k=k_value)
+            agent_loss = l1_ewta_loss_prob(agent_preds, target_dict['agent_labels'], k=k_value, mask=mask)
         if self.hparams.segment_CL or self.hparams.segment_CL_Prob or self.hparams.segment_CL_Gaussian_Prob:
             waypoint_loss = l1_ewta_waypoint_loss(agent_waypoint_predictions, target_dict['agent_labels'],
                                                   k_value, self.hparams.waypoint_step)

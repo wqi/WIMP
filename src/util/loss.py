@@ -20,17 +20,21 @@ def l1_ewta_loss(prediction, target, k=6, eps=1e-7, mr=2.0):
     return loss
 
 
-def l1_ewta_loss_prob(prediction, target, k=6, eps=1e-6, mr=2.0):
+def l1_ewta_loss_prob(prediction, target, k=6, eps=1e-6, mr=2.0, mask=None):
     num_mixtures = prediction.shape[1]
     output_dim = target.shape[-1]
 
     target = target.unsqueeze(1).expand(-1, num_mixtures, -1, -1)
     xy_points = prediction.narrow(-1, 0, output_dim)
     probs = prediction.narrow(-1, output_dim, 1).squeeze(-1)
+    if mask is not None:
+        probs = probs * mask.unsqueeze(1)   
     sequence_probs = nn.functional.softmax(torch.sum(probs, -1), -1)
     sequence_probs_clamped = torch.clamp(sequence_probs, min=0. + eps, max=1. - eps)
-
-    l1_loss = nn.functional.l1_loss(xy_points, target, reduction='none').sum(dim=[2, 3])
+    l1_loss = nn.functional.l1_loss(xy_points, target, reduction='none')
+    if mask is not None:
+        l1_loss = l1_loss * mask.unsqueeze(1).unsqueeze(-1)
+    l1_loss = l1_loss.sum(dim=[2, 3])
 
     # Get loss from top-k mixtures for each timestep
     mixture_loss_sorted, mixture_ranks = torch.sort(l1_loss, descending=False)
