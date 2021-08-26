@@ -18,15 +18,19 @@ def compute_metrics(preds, truth, mode='mean', aggregation='agent', miss_thresho
     # Reshape inputs based on aggregation type
     if aggregation == 'agent':
         truth = truth.unsqueeze(1)
-        mask = (mask.sum(-1) > 0).float()
+        num_agent_mask = (mask.sum(-1) > 0).float()
     elif aggregation == 'scenario':
+        raise NotImplementedError
         truth = truth.unsqueeze(1)
         mask = (mask.sum(-1) > 0).float()
     
     # Compute metrics for all agents and scenarios
     l2_all = torch.sqrt(torch.sum((preds - truth)**2, dim=-1))
+    l2_all = l2_all * mask.unsqueeze(1)
+
     ade_all = torch.sum(l2_all, dim=-1) / preds.size(-2)
     fde_all = l2_all[..., -1]
+
     min_fde_idx = torch.argmin(fde_all, dim=-1).unsqueeze(-1)
     fde = torch.gather(fde_all, -1, min_fde_idx).squeeze(-1)
     ade = torch.gather(ade_all, -1, min_fde_idx).squeeze(-1)
@@ -47,9 +51,9 @@ def compute_metrics(preds, truth, mode='mean', aggregation='agent', miss_thresho
             ade = torch.mean(wc_ade)
             mr = torch.mean((wc_fde > miss_threshold).float())  # Reported per-scenario
     elif aggregation == 'agent':
-        fde = torch.sum(fde) / mask.sum()
-        ade = torch.sum(ade) / mask.sum()
-        mr = torch.sum(miss) / mask.sum()
+        fde = torch.sum(fde) / num_agent_mask.sum()
+        ade = torch.sum(ade) / num_agent_mask.sum()
+        mr = torch.sum(miss) / num_agent_mask.sum()
 
     return (ade, fde, mr)
 
