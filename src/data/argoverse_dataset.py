@@ -337,7 +337,7 @@ class ArgoverseDataset(Dataset):
                       'num_agent_mask': num_agent_mask
                       }
 
-        if self.mode != 'test':
+        if self.mode != 'test_nolabel':
             target_dict = {'agent_labels': agent_labels,
                         #    'agent_xy_ref_end': ifc_helpers['agent_xy_delta'] if self.delta else None,
                         #    'social_labels': social_labels,

@@ -49,7 +49,7 @@ def add_experimental_args(parent_parser):
     parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
     # General Params
-    parser.add_argument("--mode", required=True, type=str, choices=['train', 'val', 'trainval', 'oracle-val'],
+    parser.add_argument("--mode", required=True, type=str, choices=['train', 'val', 'trainval', 'oracle-val', 'test'],
                         help='Mode to run forecasting model in')
     parser.add_argument('--seed', type=int, help="Seed the random parameter generation")
 
@@ -121,8 +121,12 @@ def cli_main(args):
                          distributed_backend=args.distributed_backend, num_nodes=args.num_nodes,
                          precision=args.precision, resume_from_checkpoint=resume_from_checkpoint,
                          logger=logger, callbacks=[early_stop_cb], checkpoint_callback=checkpoint_callback, gradient_clip_val=(5.0 if args.gradient_clipping else 0.0))
-    trainer.fit(model, dm)
-
+    if args.mode == 'train' or args.mode == 'trainval':
+        trainer.fit(model, dm)
+    elif args.mode == 'test' or args.mode == 'argoverse-test':
+        trainer.test(model, datamodule=dm)
+    else:
+        raise NotImplementedError
 
 if __name__ == '__main__':
     args = parse_arguments()

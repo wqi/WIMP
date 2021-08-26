@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from src.models.WIMP_decoder import WIMPDecoder
 from src.models.WIMP_encoder import WIMPEncoder
 from src.models.GAT import GraphAttentionLayer
-from src.util.metrics import compute_metrics
+from src.util.metrics import compute_metrics, compute_metrics_1
 from src.util.loss import l1_ewta_loss, l1_ewta_loss_prob, l1_ewta_waypoint_loss,\
     l1_ewta_encoder_waypoint_loss
 
@@ -140,7 +140,25 @@ class WIMP(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         # TODO: Implement generation of leaderboard submission formats
-        return -1
+        input_dict, target_dict = batch
+        preds, waypoint_preds, all_dist_params = self(**input_dict)
+        # Compute loss and metrics
+        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds, mask=input_dict['ifc_helpers']['agent_label_mask'])
+        agent_mean_ade, agent_mean_fde, agent_mean_mr = metrics
+
+        agent_preds = preds.narrow(dim=1, start=0, length=1).squeeze(1)
+        
+        self.log('test/loss', loss, on_epoch=True, sync_dist=True, logger=True)
+        self.log('test/agent_ade', agent_mean_ade, on_epoch=True, sync_dist=True, logger=True)
+        self.log('test/agent_fde', agent_mean_fde, on_epoch=True, sync_dist=True, logger=True)
+        self.log('test/mr', agent_mean_mr, on_epoch=True, sync_dist=True, logger=True)
+        for mode in range(agent_preds.size(1)):
+            out = compute_metrics(agent_preds.narrow(1, mode, 1).detach().narrow(-1, 0, self.hparams.output_dim), target_dict['agent_labels'],
+                               mask=input_dict['ifc_helpers']['agent_label_mask'])
+            self.log('test/agent_ade_k=1_mode={}'.format(mode), out[0], on_epoch=True, sync_dist=True, logger=True)
+            self.log('test/agent_fde_k=1_mode={}'.format(mode), out[1], on_epoch=True, sync_dist=True, logger=True)
+            self.log('test/mr_k=1_mode={}'.format(mode), out[2], on_epoch=True, sync_dist=True, logger=True)
+            
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
@@ -190,15 +208,15 @@ class WIMP(pl.LightningModule):
                                                        target_dict['agent_xy_ref_end'].unsqueeze(1))
                 labels_preds_denorm = self.denorm_delta(target_dict['agent_labels'].detach(),
                                                         target_dict['agent_xy_ref_end'].unsqueeze(1))
-                agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(agent_preds_denorm, labels_preds_denorm)
+                agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(agent_preds_denorm, labels_preds_denorm, mask=mask)
             else:
                 if agent_preds.size(-1) == 2:
                     if agent_preds.size(1) > 6:
                         agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
-                            agent_preds.detach().narrow(1, 0, 6), target_dict['agent_labels'])
+                            agent_preds.detach().narrow(1, 0, 6), target_dict['agent_labels'], mask=mask)
                     else:
                         agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
-                            agent_preds.detach(), target_dict['agent_labels'])
+                            agent_preds.detach(), target_dict['agent_labels'], mask=mask)
                 else:
                     if agent_preds.size(1) > 6:
                         probs = agent_preds.detach().narrow(-1, self.hparams.output_dim, 1).squeeze(-1)
@@ -209,10 +227,9 @@ class WIMP(pl.LightningModule):
                             1, sorted_indices.unsqueeze(-1).unsqueeze(-1).expand(
                                 -1, -1, agent_preds.size(2), self.hparams.output_dim))
                         agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
-                            curr_preds, target_dict['agent_labels'])
+                            curr_preds, target_dict['agent_labels'], mask=mask)
                     else:
                         agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
                             agent_preds.detach().narrow(-1, 0, self.hparams.output_dim),
-                            target_dict['agent_labels'])
-
+                            target_dict['agent_labels'], mask=mask)
         return total_loss, (agent_mean_ade, agent_mean_fde, agent_mean_mr)
