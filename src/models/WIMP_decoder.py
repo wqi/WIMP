@@ -154,3 +154,35 @@ class WIMPDecoder(nn.Module):
         predictions_tensor = torch.stack(predictions, 2).unsqueeze(1)
         waypoint_tensor = torch.stack(waypoint_predictions, 2).unsqueeze(1)
         return predictions_tensor, waypoint_tensor, []
+
+class LSTMDecoder(nn.Module):
+    def __init__(self, hparams):
+        super(LSTMDecoder, self).__init__()
+        self.hparams = hparams
+        self.hparams.predictor_output_dim = self.hparams.num_mixtures*(self.hparams.output_dim)
+        self.non_linearity = nn.Tanh() if self.hparams.non_linearity == 'tanh' else nn.ReLU()
+        self.lstm = nn.LSTM(input_size=self.hparams.hidden_dim*self.hparams.num_mixtures, hidden_size=self.hparams.hidden_dim, num_layers=self.hparams.num_layers, batch_first=True, dropout=self.hparams.dropout)
+        self.lstm_input_transform = nn.Linear(self.hparams.input_dim, self.hparams.hidden_dim)
+        self.predictor = nn.Linear(self.hparams.hidden_dim, self.hparams.predictor_output_dim) if self.hparams.output_prediction else nn.Linear(self.hparams.hidden_dim*self.hparams.num_layers, self.hparams.predictor_output_dim) 
+
+    def forward(self, decoder_input_features, last_n_predictions, hidden_decoder, outsteps, ifc_helpers=None, sample_next=False, map_estimate=False, mixture_num=-1, sample_centerline=False):
+        if self.hparams.distributed_backend == 'dp':
+            self.lstm.flatten_parameters()
+
+        # Decode
+        predictions = []
+        num_batches = decoder_input_features.size(0)
+        decoder_input_features = decoder_input_features.repeat(1,self.hparams.num_mixtures,1)
+        for timestep in range(outsteps):
+            curr_features = self.non_linearity(self.lstm_input_transform(decoder_input_features))
+            curr_features = curr_features.view(num_batches, 1, -1)
+            current_decoding, hidden_decoder = self.lstm(curr_features, hidden_decoder)
+            if self.hparams.output_prediction:
+                curr_prediction = self.predictor(current_decoding)
+            else:
+                curr_prediction = self.predictor(hidden_decoder[0].transpose(0,1).contiguous().view(hidden_decoder[0].size(1), -1)).unsqueeze(1)
+            curr_prediction = curr_prediction.view(curr_prediction.size(0), self.hparams.num_mixtures, -1)
+            predictions.append(curr_prediction)
+            decoder_input_features = curr_prediction.detach().view(*decoder_input_features.size())
+        predictions_tensor = torch.stack(predictions, 2).unsqueeze(1)
+        return predictions_tensor, [], []

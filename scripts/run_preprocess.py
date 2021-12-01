@@ -57,7 +57,10 @@ def parse_arguments():
     parser.add_argument('--centerline-span', type=int, default=10,
                         help="Number of points on either side of closes centerline point. \
                               Only applicable with --extra-map-features flag.")
-    parser.add_argument('--timesteps', type=int, default=20, help="Length of input timesteps")
+    parser.add_argument('--timesteps', type=int, default=50, help="Length of input timesteps")
+    parser.add_argument('--outsteps', type=int, default=60, help="Length of output timesteps")
+    parser.add_argument('--total-timesteps', type=int, default=50, help="Length of total input timesteps")
+    parser.add_argument('--total-outsteps', type=int, default=60, help="Length of total output timesteps")
     parser.add_argument('--test-labels-path', type=str, default="",
                         help="Path to test labels (if available)")
     parser.add_argument('--generate-candidate-centerlines', type=int, default=0,
@@ -405,7 +408,7 @@ class ScenarioMap:
 
 
 def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=True,
-                     map_features_flag=True, social_features_flag=True, timesteps=20, avm=None,
+                     map_features_flag=True, social_features_flag=True, timesteps=50, outsteps=60, total_timesteps=50, total_outsteps=60, avm=None,
                      mfu=None, return_labels=False, label_path="", generate_candidate_centerlines=0,
                      compute_all=False):
     """
@@ -658,14 +661,26 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                         map_features.update(extra_features_label_partial)
         return map_features
 
-    def compute_social_features(social_agents, map_json, timesteps=20, avm=None, mfu=None, rotation=None,
+    def compute_social_features(social_agents, map_json, timesteps=50, outsteps=60, total_timesteps=50, total_outsteps=60, avm=None, mfu=None, rotation=None,
                                 translation=None, generate_candidate_centerlines=0):
         social_features_all = []
         for track_id, social_agent in social_agents.items():
             social_features = OrderedDict([])
             xy_locations = np.array([state.position for state in social_agent.object_states])
             tstamps = np.array([state.timestep for state in social_agent.object_states])
-           
+
+            # To remove start
+            combined_traj = np.zeros((total_timesteps + total_outsteps,2))
+            combined_traj[tstamps] = xy_locations
+            timestep_offset = (total_timesteps - timesteps)
+            outstep_offset = (total_timesteps + outsteps)
+            tstamps = np.array([x for x in tstamps if x >=timestep_offset and x <outstep_offset])
+            if len(tstamps) == 0:
+                continue
+            xy_locations = combined_traj[tstamps]
+            tstamps = np.array([x - timestep_offset for x in tstamps])
+            # To remove end
+
             # Remove actors that appear after first 2 seconds
             if tstamps[0] < timesteps:
                 # Remove trajectories that are too small
@@ -739,6 +754,17 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
         return None
     xy_locations = np.array([state.position for state in agent_track.object_states])
     agent_tstamps = np.array([state.timestep for state in agent_track.object_states])
+    
+    # To remove start
+    combined_traj = np.zeros((total_timesteps + total_outsteps,2))
+    combined_traj[agent_tstamps] = xy_locations
+    timestep_offset = (total_timesteps - timesteps)
+    outstep_offset = (total_timesteps + outsteps)
+    agent_tstamps = np.array([x for x in agent_tstamps if x >=timestep_offset and x < outstep_offset])
+    xy_locations = combined_traj[agent_tstamps]
+    agent_tstamps = np.array([x - timestep_offset for x in agent_tstamps])
+    # To remove end
+
     agent_tsteps = np.sum(agent_tstamps < timesteps)
     agent_features = {}
     if agent_tsteps < timesteps:
@@ -784,18 +810,17 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
                                                 generate_candidate_centerlines=generate_candidate_centerlines, # NOQA
                                                 compute_all=compute_all)
         agent_features.update(map_features)
-
     # Compute social features
     if social_features_flag:
         if xy_features_normalize_flag:
             social_features = compute_social_features(social_agents={x:y for x,y in all_tracks.items() if x!=data.focal_track_id}, map_json=map_json,
-                                                      timesteps=timesteps, avm=avm, mfu=mfu,
+                                                      timesteps=timesteps, outsteps=outsteps, total_timesteps=total_timesteps, total_outsteps=total_outsteps, avm=avm, mfu=mfu,
                                                       rotation=xy_feature_helpers['ROTATION'],
                                                       translation=xy_feature_helpers['TRANSLATION'],
                                                       generate_candidate_centerlines=generate_candidate_centerlines) # NOQA
         else:
             social_features = compute_social_features(social_agents={x:y for x,y in all_tracks.items() if x!=data.focal_track_id}, map_json=map_json,
-                                                      timesteps=timesteps, avm=avm, mfu=mfu,
+                                                      timesteps=timesteps, outsteps=outsteps, total_timesteps=total_timesteps, total_outsteps=total_outsteps, avm=avm, mfu=mfu,
                                                       generate_candidate_centerlines=generate_candidate_centerlines) # NOQA
         final_features['SOCIAL'] = social_features
 
@@ -808,7 +833,6 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
 
     if bool(agent_features):
         final_features['AGENT'] = agent_features
-
     return final_features
 
 
@@ -855,7 +879,7 @@ def compute_features_wrapper(kwargs):
 
 def compute_features_iterator(path, save_dir, xy_features_flag=True,
                               xy_features_normalize_flag=True, map_features_flag=True,
-                              social_features_flag=True, timesteps=20, return_labels=True,
+                              social_features_flag=True, timesteps=50, outsteps=60, total_timesteps=50, total_outsteps=60, return_labels=True,
                               generate_candidate_centerlines=0, compute_all=False):
     """
     Compute features for all the trajectories in a directory
@@ -907,7 +931,7 @@ def compute_features_iterator(path, save_dir, xy_features_flag=True,
                         'xy_features_normalize_flag': xy_features_normalize_flag,
                         'map_features_flag': map_features_flag,
                         'social_features_flag': social_features_flag, 'avm': avm, 'mfu': mfu,
-                        'timesteps': timesteps, 'return_labels': return_labels,
+                        'timesteps': timesteps, 'outsteps': outsteps, 'total_timesteps': total_timesteps, 'total_outsteps': total_outsteps, 'return_labels': return_labels,
                         'label_path': label_path,
                         'generate_candidate_centerlines': generate_candidate_centerlines,
                         'compute_all': compute_all}
@@ -931,6 +955,6 @@ if __name__ == '__main__':
                               social_features_flag=args.social_features,
                               map_features_flag=args.map_features,
                               xy_features_flag=args.xy_features,
-                              xy_features_normalize_flag=args.normalize, timesteps=args.timesteps,
+                              xy_features_normalize_flag=args.normalize, timesteps=args.timesteps, outsteps=args.outsteps, total_timesteps=args.total_timesteps, total_outsteps=args.total_outsteps,
                               generate_candidate_centerlines=args.generate_candidate_centerlines,
                               compute_all=args.compute_all)

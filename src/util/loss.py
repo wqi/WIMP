@@ -2,11 +2,14 @@ import torch
 import torch.nn as nn
 
 
-def l1_ewta_loss(prediction, target, k=6, eps=1e-7, mr=2.0):
+def l1_ewta_loss(prediction, target, k=6, eps=1e-7, mr=2.0, mask=None):
     num_mixtures = prediction.shape[1]
 
     target = target.unsqueeze(1).expand(-1, num_mixtures, -1, -1)
-    l1_loss = nn.functional.l1_loss(prediction, target, reduction='none').sum(dim=[2, 3])
+    l1_loss = nn.functional.l1_loss(prediction, target, reduction='none')
+    if mask is not None:
+        l1_loss = l1_loss * mask.unsqueeze(-1).unsqueeze(1)
+    l1_loss = l1_loss.sum(dim=[2, 3])
 
     # Get loss from top-k mixtures for each timestep
     mixture_loss_sorted, mixture_ranks = torch.sort(l1_loss, descending=False)
@@ -14,8 +17,11 @@ def l1_ewta_loss(prediction, target, k=6, eps=1e-7, mr=2.0):
 
     # Aggregate loss across timesteps and batch
     loss = mixture_loss_topk.sum()
-    loss = loss / target.size(0)
-    loss = loss / target.size(2)
+    if mask is not None:
+        loss = loss / mask.sum()
+    else:
+        loss = loss / target.size(0)
+        loss = loss / target.size(2)
     loss = loss / k
     return loss
 

@@ -23,10 +23,10 @@ class ArgoverseDataModule(pl.LightningDataModule):
         pass
 
     def get_dataloader(self, mode, cfg):
-        ds = ArgoverseDataset(self.cfg.dataroot, mode=mode, delta=self.cfg.predict_delta,
+        ds = ArgoverseDataset(self.cfg.dataroot, mode=mode, delta=self.cfg.predict_delta, timesteps=self.cfg.timesteps, outsteps=self.cfg.outsteps,
                               map_features_flag=self.cfg.map_features,
                               social_features_flag=True, heuristic=(not self.cfg.no_heuristic),
-                              ifc=self.cfg.IFC, is_oracle=self.cfg.use_oracle, filter_data=self.cfg.filter_data)
+                              ifc=self.cfg.IFC, is_oracle=self.cfg.use_oracle, filter_data=self.cfg.filter_data, variable_length_training=self.cfg.variable_length_training, variable_scenario_training=self.cfg.variable_scenario_training, renormalize=self.cfg.renormalize, no_rotate=self.cfg.no_rotate)
 
         shuffle = False if mode == 'val' or mode == 'test' else True
         drop_last = shuffle
@@ -40,7 +40,7 @@ class ArgoverseDataModule(pl.LightningDataModule):
         return self.get_dataloader(train_split, self.cfg)
 
     def val_dataloader(self):
-        return self.get_dataloader('val', self.cfg)
+        return self.get_dataloader('test', self.cfg)
 
     def test_dataloader(self):
         return self.get_dataloader('test', self.cfg)

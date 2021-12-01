@@ -7,13 +7,13 @@ from argparse import ArgumentParser
 from pytorch_lightning.metrics.functional import accuracy
 from torch.nn import functional as F
 
-from src.models.WIMP_decoder import WIMPDecoder
-from src.models.WIMP_encoder import WIMPEncoder
+from src.models.WIMP_decoder import WIMPDecoder, LSTMDecoder
+from src.models.WIMP_encoder import WIMPEncoder, LSTMEncoder
 from src.models.GAT import GraphAttentionLayer
 from src.util.metrics import compute_metrics, compute_metrics_1
 from src.util.loss import l1_ewta_loss, l1_ewta_loss_prob, l1_ewta_waypoint_loss,\
     l1_ewta_encoder_waypoint_loss
-
+import pickle
 
 class WIMP(pl.LightningModule):
     @staticmethod
@@ -44,6 +44,7 @@ class WIMP(pl.LightningModule):
         parser.add_argument("--segment-CL-Encoder-Prob", action='store_true', help="Use CL segment encoder with distance with prob") # NOQA
         parser.add_argument("--segment-CL-Encoder-Gaussian-Prob", action='store_true', help="Use CL segment encoder with gaussian attention with prob") # NOQA
         parser.add_argument("--segment-CL-Gaussian-Prob", action='store_true', help="Use CL segment with gaussian attention with prob") # NOQA
+        parser.add_argument("--lstm-encoder-decoder", action='store_true', help='Use LSTM without social context')
 
         # Optimization Params
         parser.add_argument("--lr", type=float, default=0.0001, help='Learning rate')
@@ -55,52 +56,74 @@ class WIMP(pl.LightningModule):
         parser.add_argument("--scheduler-step-size", nargs='+', type=int, default=[30, 60, 90, 120, 150])
         parser.add_argument("--wta", action='store_true', help="Use Winner Takes All approach")
         parser.add_argument("--filter-data", action='store_true', help="Filter data based on 50+60")
+        parser.add_argument("--timesteps", type=int, default=50, help="Number of input timesteps")
+        parser.add_argument("--outsteps", type=int, default=60, help="Number of output timesteps")
+        parser.add_argument("--random-hidden-state", action='store_true', help='Randomly initialize hidden state')
+        parser.add_argument("--learnable-hidden-state", action='store_true', help='Model hidden state as a parameter')
+        parser.add_argument("--variable-length-training", action='store_true', help="Train using variable input lengths")
+        parser.add_argument("--variable-scenario-training", action='store_true', help="Train using variable sequences")
+        parser.add_argument("--renormalize", action='store_true', help='Renormalize input')
+        parser.add_argument("--no-rotate", action='store_true', help='No rotation normalization')
         return parser
 
     def __init__(self, hparams, hidden_dim=128):
         super(WIMP, self).__init__()
         self.hparams = hparams
 
-        self.encoder = WIMPEncoder(self.hparams)
-        self.gat = GraphAttentionLayer(self.hparams.hidden_dim, self.hparams.hidden_dim,
+        if self.hparams.lstm_encoder_decoder:
+            self.encoder = LSTMEncoder(self.hparams)
+        else:    
+            self.encoder = WIMPEncoder(self.hparams)
+
+        if not self.hparams.lstm_encoder_decoder:
+            self.gat = GraphAttentionLayer(self.hparams.hidden_dim, self.hparams.hidden_dim,
                                        self.hparams.graph_iter, self.hparams.attention_heads,
                                        self.hparams.dropout)
-        self.decoder = WIMPDecoder(self.hparams)
+        if self.hparams.lstm_encoder_decoder:
+            self.decoder = LSTMDecoder(self.hparams)
+        else: 
+            self.decoder = WIMPDecoder(self.hparams)
+        self.output_dict = {}
 
     def forward(self, agent_features, social_features, adjacency, num_agent_mask, outsteps=60,
                 social_label_features=None, label_adjacency=None, classmate_forcing=True,
                 labels=None, ifc_helpers=None, test=False, map_estimate=False,
                 gt=None, idx=None, sample_next=False, num_predictions=1, am=None):
         # Encode agent and social features
+        outsteps = int(max(ifc_helpers['outsteps'].data.cpu().numpy()))
         encoding, hidden, waypoint_predictions = self.encoder(agent_features, social_features,
                                                               num_agent_mask, adjacency, ifc_helpers)
-        waypoint_predictions_tensor_encoder = waypoint_predictions.squeeze(-2).view(
-            agent_features.size(0), social_features.size(1) + 1, -1, agent_features.size(2))
+        if not self.hparams.lstm_encoder_decoder:
+            waypoint_predictions_tensor_encoder = waypoint_predictions.squeeze(-2).view(
+                agent_features.size(0), social_features.size(1) + 1, -1, agent_features.size(2))
 
-        # Perform graph message passing
-        if self.hparams.hidden_transform:
-            gan_features = torch.cat(hidden, dim=0).transpose(0, 1).view(
-                agent_features.size(0), social_features.size(1) + 1,
-                hidden[0].size(0) * 2, hidden[0].size(2))
+            # Perform graph message passing
+            if self.hparams.hidden_transform:
+                gan_features = torch.cat(hidden, dim=0).transpose(0, 1).view(
+                    agent_features.size(0), social_features.size(1) + 1,
+                    hidden[0].size(0) * 2, hidden[0].size(2))
+            else:
+                gan_features = encoding.view(social_features.size(0), social_features.size(1) + 1,
+                                            1, -1)
+            adjacency = torch.ones(gan_features.size(1), gan_features.size(1)).to(
+                gan_features.get_device()).float().unsqueeze(0).repeat(gan_features.size(0), 1, 1)
+            adjacency = adjacency * num_agent_mask.unsqueeze(1) * num_agent_mask.unsqueeze(2)
+            graph_output, _ = self.gat(gan_features, adjacency)
+            graph_output = graph_output.narrow(1, 0, 1).squeeze(1)
+            if self.hparams.batch_norm:
+                graph_output = self.encoding_bn(graph_output.transpose(1, 2).contiguous())
+                graph_output = graph_output.transpose(1, 2).contiguous()
+                
+            if self.hparams.hidden_transform:
+                hidden_decoder = torch.chunk(graph_output.view(-1, self.hparams.num_layers*2, self.hparams.hidden_dim).transpose(0,1).contiguous(), 2, dim=0)
+            else:
+                hidden_decoder = (graph_output.view(-1, 1, self.hparams.hidden_dim).transpose(0,1).contiguous(), graph_output.view(-1, 1, self.hparams.hidden_dim).transpose(0,1).contiguous())
+                hidden_decoder = (hidden_decoder[0].repeat(self.hparams.num_layers,1,1), hidden_decoder[1].repeat(self.hparams.num_layers,1,1))
         else:
-            gan_features = encoding.view(social_features.size(0), social_features.size(1) + 1,
-                                         1, -1)
-        adjacency = torch.ones(gan_features.size(1), gan_features.size(1)).to(
-            gan_features.get_device()).float().unsqueeze(0).repeat(gan_features.size(0), 1, 1)
-        adjacency = adjacency * num_agent_mask.unsqueeze(1) * num_agent_mask.unsqueeze(2)
-        graph_output, _ = self.gat(gan_features, adjacency)
-        graph_output = graph_output.narrow(1, 0, 1).squeeze(1)
-        if self.hparams.batch_norm:
-            graph_output = self.encoding_bn(graph_output.transpose(1, 2).contiguous())
-            graphoutput = graph_output.transpose(1, 2).contiguous()
-        if self.hparams.hidden_transform:
-            hidden_decoder = torch.chunk(graph_output.view(-1, self.hparams.num_layers*2, self.hparams.hidden_dim).transpose(0,1).contiguous(), 2, dim=0)
-        else:
-            hidden_decoder = (graph_output.view(-1, 1, self.hparams.hidden_dim).transpose(0,1).contiguous(), graph_output.view(-1, 1, self.hparams.hidden_dim).transpose(0,1).contiguous())
-            hidden_decoder = (hidden_decoder[0].repeat(self.hparams.num_layers,1,1), hidden_decoder[1].repeat(self.hparams.num_layers,1,1))
-
-        # Decode prediction
+            hidden_decoder = hidden
+            waypoint_predictions_tensor_encoder = []
         decoder_input_features = agent_features.narrow(dim=1, start=agent_features.size(1)-1, length=1)
+        # Decode prediction        
         last_n_predictions = []
         for i in self.hparams.xy_kernel_list:
             last_n_predictions.append(agent_features.narrow(dim=1, start=agent_features.size(1)-i, length=i))
@@ -143,22 +166,26 @@ class WIMP(pl.LightningModule):
         input_dict, target_dict = batch
         preds, waypoint_preds, all_dist_params = self(**input_dict)
         # Compute loss and metrics
-        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds, mask=input_dict['ifc_helpers']['agent_label_mask'])
+        loss, metrics = self.eval_preds(preds, target_dict, waypoint_preds, mask=input_dict['ifc_helpers']['agent_label_mask'], batch_idx=input_dict['ifc_helpers']['idx'])
         agent_mean_ade, agent_mean_fde, agent_mean_mr = metrics
 
         agent_preds = preds.narrow(dim=1, start=0, length=1).squeeze(1)
-        
         self.log('test/loss', loss, on_epoch=True, sync_dist=True, logger=True)
         self.log('test/agent_ade', agent_mean_ade, on_epoch=True, sync_dist=True, logger=True)
         self.log('test/agent_fde', agent_mean_fde, on_epoch=True, sync_dist=True, logger=True)
         self.log('test/mr', agent_mean_mr, on_epoch=True, sync_dist=True, logger=True)
+        
         for mode in range(agent_preds.size(1)):
             out = compute_metrics(agent_preds.narrow(1, mode, 1).detach().narrow(-1, 0, self.hparams.output_dim), target_dict['agent_labels'],
                                mask=input_dict['ifc_helpers']['agent_label_mask'])
             self.log('test/agent_ade_k=1_mode={}'.format(mode), out[0], on_epoch=True, sync_dist=True, logger=True)
             self.log('test/agent_fde_k=1_mode={}'.format(mode), out[1], on_epoch=True, sync_dist=True, logger=True)
             self.log('test/mr_k=1_mode={}'.format(mode), out[2], on_epoch=True, sync_dist=True, logger=True)
-            
+
+
+    def on_test_epoch_end(self):
+        with open("per_scenario_out.pkl", "wb") as f:
+            pickle.dump(self.output_dict, f)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
@@ -166,7 +193,21 @@ class WIMP(pl.LightningModule):
                                                          gamma=0.5)
         return [optimizer], [scheduler]
 
-    def eval_preds(self, preds, target_dict, waypoint_preds=None, mask=None):
+    def denorm_delta(self, predictions, helpers):
+        """Denormalize the sequence. This includes converting relative distances to absolute.
+                Args:
+                    input: Sequence that needs to be denormalized
+                    helpers: Necessary helper values
+                Returns:
+                    output: denormalized sequence
+        """
+        timesteps = predictions.shape[-2]
+        predictions[...,0,:] = predictions[...,0,:] + helpers
+        for i in range(1, timesteps):
+            predictions[...,i,:] = predictions[...,i-1,:] + predictions[...,i,:]
+        return predictions
+
+    def eval_preds(self, preds, target_dict, waypoint_preds=None, mask=None, batch_idx=None):
         # Compute current k value
         k_value_threshold = self.hparams.k_value_threshold
         k_value_index = (self.current_epoch // k_value_threshold)
@@ -182,8 +223,13 @@ class WIMP(pl.LightningModule):
             agent_waypoint_predictions = waypoint_preds[0].narrow(dim=1, start=0, length=1).squeeze(1)
             agent_encoder_waypoint_predictions = waypoint_preds[1].narrow(dim=1, start=0, length=1)
             social_encoder_waypoint_predictions = waypoint_preds[1].narrow(dim=1, start=1, length=waypoint_preds[1].size(1)-1)
+       
         if agent_preds.size(-1) == 2:
-            agent_loss = self.l1_ewta_loss(agent_preds, target_dict['agent_labels'], k=k_value)
+            try:
+                agent_loss = l1_ewta_loss(agent_preds, target_dict['agent_labels'], k=k_value, mask=mask)
+            except:
+                import ipdb; ipdb.set_trace()
+                a= 1
         else:
             agent_loss = l1_ewta_loss_prob(agent_preds, target_dict['agent_labels'], k=k_value, mask=mask)
         if self.hparams.segment_CL or self.hparams.segment_CL_Prob or self.hparams.segment_CL_Gaussian_Prob:
@@ -204,19 +250,19 @@ class WIMP(pl.LightningModule):
         # Compute metrics
         with torch.no_grad():
             if self.hparams.predict_delta:
-                agent_preds_denorm = self.denorm_delta(agent_preds.detach(),
+                agent_preds_denorm = self.denorm_delta(agent_preds.clone().detach(),
                                                        target_dict['agent_xy_ref_end'].unsqueeze(1))
-                labels_preds_denorm = self.denorm_delta(target_dict['agent_labels'].detach(),
-                                                        target_dict['agent_xy_ref_end'].unsqueeze(1))
-                agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(agent_preds_denorm, labels_preds_denorm, mask=mask)
+                labels_preds_denorm = self.denorm_delta(target_dict['agent_labels'].clone().detach(),
+                                                        target_dict['agent_xy_ref_end'])
+                agent_mean_ade, agent_mean_fde, agent_mean_mr, per_scenario_metrics = compute_metrics(agent_preds_denorm, labels_preds_denorm, mask=mask)
             else:
                 if agent_preds.size(-1) == 2:
                     if agent_preds.size(1) > 6:
-                        agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
+                        agent_mean_ade, agent_mean_fde, agent_mean_mr, per_scenario_metrics = compute_metrics(
                             agent_preds.detach().narrow(1, 0, 6), target_dict['agent_labels'], mask=mask)
                     else:
-                        agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
-                            agent_preds.detach(), target_dict['agent_labels'], mask=mask)
+                        agent_mean_ade, agent_mean_fde, agent_mean_mr, per_scenario_metrics = compute_metrics(
+                            agent_preds.detach(), target_dict['agent_labels'], mask=mask, return_per_scenario=True)
                 else:
                     if agent_preds.size(1) > 6:
                         probs = agent_preds.detach().narrow(-1, self.hparams.output_dim, 1).squeeze(-1)
@@ -226,10 +272,16 @@ class WIMP(pl.LightningModule):
                         curr_preds = agent_preds.detach().narrow(-1, 0, self.hparams.output_dim).gather(
                             1, sorted_indices.unsqueeze(-1).unsqueeze(-1).expand(
                                 -1, -1, agent_preds.size(2), self.hparams.output_dim))
-                        agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
+                        agent_mean_ade, agent_mean_fde, agent_mean_mr, per_scenario_metrics = compute_metrics(
                             curr_preds, target_dict['agent_labels'], mask=mask)
                     else:
-                        agent_mean_ade, agent_mean_fde, agent_mean_mr = compute_metrics(
+                        agent_mean_ade, agent_mean_fde, agent_mean_mr, per_scenario_metrics = compute_metrics(
                             agent_preds.detach().narrow(-1, 0, self.hparams.output_dim),
-                            target_dict['agent_labels'], mask=mask)
+                            target_dict['agent_labels'], mask=mask, return_per_scenario=True)
+        try:
+            if batch_idx is not None:
+                for curr_idx in range(agent_preds.size(0)):
+                    self.output_dict[batch_idx[curr_idx]] = {"fde": per_scenario_metrics[0][curr_idx], "ade": per_scenario_metrics[1][curr_idx], "mr":per_scenario_metrics[2][curr_idx]}
+        except:
+            pass
         return total_loss, (agent_mean_ade, agent_mean_fde, agent_mean_mr)

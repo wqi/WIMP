@@ -123,7 +123,7 @@ def cli_main(args):
                          logger=logger, callbacks=[early_stop_cb], checkpoint_callback=checkpoint_callback, gradient_clip_val=(5.0 if args.gradient_clipping else 0.0))
     if args.mode == 'train' or args.mode == 'trainval':
         trainer.fit(model, dm)
-    elif args.mode == 'test' or args.mode == 'argoverse-test':
+    elif args.mode == 'test' or args.mode == 'argoverse-test' or args.mode == 'val':
         trainer.test(model, datamodule=dm)
     else:
         raise NotImplementedError

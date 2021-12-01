@@ -28,7 +28,7 @@ class ArgoverseDataset(Dataset):
     """
     def __init__(self, data_loc, mode='train', transform=None, delta=True, timesteps=50,
                  outsteps=60, augment_data=False, map_features_flag=True, social_features_flag=True,
-                 heuristic=False, ifc=True, is_oracle=False, filter_data=False):
+                 heuristic=False, ifc=True, is_oracle=False, filter_data=False, variable_length_training=False, variable_scenario_training=False, renormalize=False, no_rotate=False):
         self.data_loc = data_loc
         self.transform = transform
         self.mode = mode
@@ -39,7 +39,14 @@ class ArgoverseDataset(Dataset):
         self.outsteps = outsteps
         self.is_oracle = is_oracle
         self.filter_data = filter_data
-
+        self.variable_length_training = variable_length_training 
+        self.variable_scenario_training = variable_scenario_training
+        self.renormalize = renormalize
+        self.no_rotate = no_rotate
+        if self.variable_length_training:
+            self.possible_lengths = [x for x in range(10,timesteps+5,5)]
+        if self.variable_scenario_training:
+            self.possible_lengths = [x for x in range(10, timesteps + outsteps - 5, 5)]
         if mode == 'trainval':
             self.sequences = [os.path.join("{}/{}".format(data_loc, 'train'), file) for file in os.listdir("{}/{}".format(data_loc, 'train'))]
             self.sequences = self.sequences + [os.path.join("{}/{}".format(data_loc, 'val'), file) for file in os.listdir("{}/{}".format(data_loc, 'val'))]
@@ -76,7 +83,7 @@ class ArgoverseDataset(Dataset):
         example['file_path'] = self.sequences[idx]
         with open(example['file_path'], 'rb') as inFile:
             data = pickle.load(inFile)
-
+        
         example['seq_id'] = data['SEQ_ID']
         example['city'] = "argoverse-2.0"
         # Get feature helpers
@@ -93,28 +100,81 @@ class ArgoverseDataset(Dataset):
         else:
             no_label = True
             example['agent_xy_labels'] = np.zeros((self.outsteps, 2), dtype=np.float)
+        curr_length = self.timesteps
+
+        if (self.variable_length_training or self.variable_scenario_training) and self.mode == 'train':
+            curr_length = np.random.choice(self.possible_lengths)
+            total_agent_length = example['agent_xy_features'].shape[0]
+            if not no_label:
+                total_agent_length = total_agent_length + example['agent_xy_labels'].shape[0]
+            if total_agent_length < (curr_length + 10):
+                curr_length = data['AGENT']['XY_FEATURES'].shape[0]
+            
 
         agent_str = '_FULL' if self.is_oracle else '_PARTIAL'
+        agent_tstamps = data['AGENT']['TSTAMPS']
+        # Compute mask for agents that don't have information for all timesteps
+
+        agent_mask = np.full(self.timesteps + self.outsteps, False)
+        agent_mask[agent_tstamps] = True
+        if self.variable_scenario_training:
+            agent_input_mask = agent_mask[:curr_length]
+            agent_label_mask = agent_mask[curr_length:]
+            if agent_input_mask.sum() == 0:
+                curr_length = self.timesteps
+                agent_input_mask = agent_mask[:self.timesteps]
+                agent_label_mask = agent_mask[self.timesteps:]
+        else:
+            agent_input_mask = agent_mask[:self.timesteps]
+            agent_label_mask = agent_mask[self.timesteps:]
+            if (self.variable_length_training or self.renormalize):
+                agent_input_mask = agent_input_mask[self.timesteps - curr_length:]
+
+        example['agent_input_mask'] = agent_input_mask
+        if not no_label:
+            example['agent_label_mask'] = agent_label_mask
+        else:
+            example['agent_label_mask'] = (agent_label_mask * 0) == 1
+        if (self.variable_length_training or self.variable_scenario_training or self.renormalize):
+            agent_traj = example['agent_xy_features'][:]
+            if not no_label:
+                agent_traj = np.vstack((agent_traj, example['agent_xy_labels']))
+
+            agent_traj = self.denormalize_xy(agent_traj, translation=[-example['translation'][0], -example['translation'][1]], rotation=-example['rotation'])
+            if self.variable_scenario_training:
+                example['agent_xy_features'] = agent_traj[:agent_input_mask.sum()]
+            else:
+                example['agent_xy_features'] = agent_traj[max(0, data['AGENT']['XY_FEATURES'].shape[0] - curr_length):data['AGENT']['XY_FEATURES'].shape[0], :]
+            try:
+                example['agent_xy_features'], feature_helpers = self.normalize_xy(example['agent_xy_features'], renormalize=self.renormalize, to_rotate=(not self.no_rotate))
+            except:
+                import ipdb; ipdb.set_trace()
+                a = 1
+            agent_centerline = data['AGENT'][self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+agent_str][:]
+            agent_centerline = self.denormalize_xy(agent_centerline, translation=[-example['translation'][0], -example['translation'][1]], rotation=-example['rotation'])
+            data['AGENT'][self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+agent_str] = self.normalize_xy(agent_centerline, translation=feature_helpers['TRANSLATION'], rotation=feature_helpers['ROTATION'], renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
+            if not no_label:
+                if self.variable_scenario_training:
+                    if len(agent_traj[curr_length:, :]) > 1:
+                        example['agent_xy_labels'] = self.normalize_xy(agent_traj[agent_input_mask.sum():, :], translation=feature_helpers['TRANSLATION'], rotation=feature_helpers['ROTATION'], renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
+                    else:
+                        example['agent_xy_labels'] = self.normalize_xy(agent_traj[agent_input_mask.sum():, :], translation=feature_helpers['TRANSLATION'], rotation=None, renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
+                else:
+                    if len(agent_traj[self.timesteps:, :]) > 1:
+                        example['agent_xy_labels'] = self.normalize_xy(agent_traj[data['AGENT']['XY_FEATURES'].shape[0]:, :], translation=feature_helpers['TRANSLATION'], rotation=feature_helpers['ROTATION'], renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
+                    else:
+                        example['agent_xy_labels'] = self.normalize_xy(agent_traj[data['AGENT']['XY_FEATURES'].shape[0]:, :], translation=feature_helpers['TRANSLATION'], rotation=None, renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
 
         # Get centerline for IFC
         if not self.is_oracle:
             example['agent_oracle_centerline'] = data['AGENT'][self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+agent_str]
             example['agent_oracle_centerline_lengths'] = example['agent_oracle_centerline'].shape[0]
-            agent_tstamps = data['AGENT']['TSTAMPS']
-            # Compute mask for agents that don't have information for all timesteps
-            agent_mask = np.full(self.timesteps + self.outsteps, False)
-            agent_mask[agent_tstamps] = True
-            agent_input_mask = agent_mask[:self.timesteps]
-            agent_label_mask = agent_mask[self.timesteps:]
-            example['agent_input_mask'] = agent_input_mask
-            if not no_label:
-                example['agent_label_mask'] = agent_label_mask
-            else:
-                example['agent_label_mask'] = (agent_label_mask * 0) == 1
+           
             # Add noise
             if self.mode == 'train':
-                rotation_sign = 1.0 if np.random.binomial(1, 0.5) == 1 else -1.0
-                rotation = np.random.random() * 27.0 * rotation_sign
+                # rotation_sign = 1.0 if np.random.binomial(1, 0.5) == 1 else -1.0
+                # rotation = np.random.random() * 27.0 * rotation_sign
+                rotation = None
                 translation_sign = 1.0 if np.random.binomial(1, 0.5) == 1 else -1.0
                 translation = np.random.random(2) * translation_sign
                 agent_all_features = np.vstack([example['agent_xy_features'], example['agent_xy_labels']])
@@ -125,10 +185,18 @@ class ArgoverseDataset(Dataset):
                     example['agent_oracle_centerline'] = self.add_noise(example['agent_oracle_centerline'], rotation=rotation, translation=translation)
                 except:
                     pass
-            agent_padded_xy = np.zeros((self.timesteps, 2), dtype=np.float)
-            agent_padded_labels = np.zeros((self.outsteps, 2), dtype=np.float)
-            agent_padded_xy[agent_input_mask] = example['agent_xy_features']
+            if (self.variable_length_training or self.variable_scenario_training or self.renormalize):
+                agent_padded_xy = np.zeros((curr_length, 2), dtype=np.float)
+            else:
+                agent_padded_xy = np.zeros((self.timesteps, 2), dtype=np.float)
+            if self.variable_scenario_training:
+                agent_padded_labels = np.zeros((self.timesteps + self.outsteps - curr_length, 2), dtype=np.float)
+            else:
+                agent_padded_labels = np.zeros((self.outsteps, 2), dtype=np.float)
+
+            agent_padded_xy[agent_input_mask] = example['agent_xy_features']            
             agent_padded_labels[agent_label_mask] = example['agent_xy_labels']
+        
             example['agent_xy_features'] = agent_padded_xy[:,:]
             example['agent_xy_labels'] = agent_padded_labels[:,:]
             # if example['agent_xy_labels'].shape[0] < self.outsteps:
@@ -178,17 +246,55 @@ class ArgoverseDataset(Dataset):
                 if social_num >= self.max_social_agents:
                     break
                 tstamps = social_features['TSTAMPS']
+
                 # Check if social agent has 2 seconds of history
                 if social_features['XY_FEATURES'].shape[0] <= self.timesteps:
-
                     # Compute mask for agents that don't have information for all timesteps
                     mask = np.full(self.timesteps + self.outsteps, False)
                     mask[tstamps] = True
-                    input_mask = mask[:self.timesteps]
-                    label_mask = mask[self.timesteps:]
+                    if self.variable_scenario_training:
+                        input_mask = mask[:curr_length]
+                        label_mask = mask[curr_length:]
+                    else:
+                        input_mask = mask[:self.timesteps]
+                        label_mask = mask[self.timesteps:]
+                        if (self.variable_length_training or self.renormalize):
+                            input_mask = input_mask[self.timesteps - curr_length:]     
+                    if input_mask.sum() < 2:
+                        continue               
+                    if (self.variable_length_training or self.variable_scenario_training or self.renormalize):
+                        if 'LABELS' in social_features and len(social_features['LABELS']) > 0:
+                            all_features = np.vstack([social_features['XY_FEATURES'], social_features['LABELS']])
+                        else:
+                            all_features = social_features['XY_FEATURES']
+
+                        all_features = self.denormalize_xy(all_features, translation=[-example['translation'][0], -example['translation'][1]], rotation=-example['rotation'])                       
+                        if not self.variable_scenario_training:                          
+                            length_mask = np.full(self.timesteps + self.outsteps, False)
+                            length_mask[(self.timesteps - curr_length):] = True
+                            input_select = mask & length_mask
+                            all_features_padded = np.zeros((self.timesteps + self.outsteps, 2), dtype=np.float)
+                            all_features_padded[mask] = all_features[:,:]
+                            all_features = all_features_padded[input_select]
+                        if len(all_features) < 2:
+                            continue
+                        if len(all_features) > 1:
+                            all_features = self.normalize_xy(all_features, translation=feature_helpers['TRANSLATION'], rotation=feature_helpers['ROTATION'], renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
+                        else:                            
+                            all_features = self.normalize_xy(all_features, translation=feature_helpers['TRANSLATION'], rotation=None, renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
+
+                        if self.variable_scenario_training:
+                            social_features['XY_FEATURES'] = all_features[:input_mask.sum()]
+                        else:
+                            social_features['XY_FEATURES'] = all_features[:input_select[(self.timesteps - curr_length):self.timesteps].sum(), :]
+                        if 'LABELS' in social_features and len(social_features['LABELS']) > 0:
+                            if self.variable_scenario_training:
+                                social_features['LABELS'] = all_features[input_mask.sum():]                                
+                            else:
+                                social_features['LABELS'] = all_features[input_select[(self.timesteps - curr_length):self.timesteps].sum(): , :]
+
                     social['social_input_mask'].append(input_mask)
                     social['social_label_mask'].append(label_mask)
-
                     # Add noise
                     if self.mode == 'train':
                         if 'LABELS' in social_features and len(social_features['LABELS']) > 0:
@@ -199,9 +305,13 @@ class ArgoverseDataset(Dataset):
                         social_features['XY_FEATURES'] = all_features[:social_features['XY_FEATURES'].shape[0], :]
                         if 'LABELS' in social_features:
                             social_features['LABELS'] = all_features[social_features['XY_FEATURES'].shape[0]:, :]
+                            
+                    # Get xy coordinates                    
+                    if (self.variable_length_training or self.variable_scenario_training or self.renormalize):
+                        padded_xy = np.zeros((curr_length, 2), dtype=np.float)
+                    else:
+                        padded_xy = np.zeros((self.timesteps, 2), dtype=np.float)
 
-                    # Get xy coordinates
-                    padded_xy = np.zeros((self.timesteps, 2), dtype=np.float)
                     padded_xy[input_mask] = social_features['XY_FEATURES']
                     social['social_xy_features'].append(padded_xy)
 
@@ -209,9 +319,16 @@ class ArgoverseDataset(Dataset):
                     labels = np.array([])
                     if 'LABELS' in social_features:
                         labels = social_features['LABELS']
-                    padded_labels = np.zeros((self.outsteps, 2), dtype=np.float)
+                    if self.variable_scenario_training:
+                        padded_labels = np.zeros((self.timesteps + self.outsteps - curr_length, 2), dtype=np.float)
+                    else:
+                        padded_labels = np.zeros((self.outsteps, 2), dtype=np.float)
                     if len(labels) > 0:
-                        padded_labels[label_mask] = labels
+                        try:
+                            padded_labels[label_mask] = labels
+                        except:
+                            import ipdb; ipdb.set_trace()
+                            a= 1
                     social['social_xy_labels'].append(padded_labels)
 
                     if len(labels) == 0 or self.mode != 'train':
@@ -222,15 +339,17 @@ class ArgoverseDataset(Dataset):
 
                     if self.mode == 'train':
                         try:
+                            if (self.variable_length_training or self.variable_scenario_training or self.renormalize) and self.mode == 'train':
+                                social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str] = self.denormalize_xy(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str], translation=[-example['translation'][0], -example['translation'][1]], rotation=-example['rotation'])
+                                social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str] = self.normalize_xy(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str],  translation=feature_helpers['TRANSLATION'], rotation=feature_helpers['ROTATION'], renormalize=self.renormalize, to_rotate=(not self.no_rotate))[0]
                             social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str] = self.add_noise(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str], rotation=rotation, translation=translation)
                         except:
                             pass
                     social['social_oracle_centerline'].append(social_features[self.heuristic_str+'ORACLE_CENTERLINE_NORMALIZED'+social_str])
                     social['social_oracle_centerline_lengths'].append(social_features[self.heuristic_str + 'ORACLE_CENTERLINE_NORMALIZED'+social_str].shape[0])              
                     num_social_agents += 1
-
+        
         # Pad centerlines
-
         social_max_pad = np.max(social['social_oracle_centerline_lengths'])
         if social_max_pad < np.max(example['agent_oracle_centerline_lengths']):
             social_max_pad = np.max(example['agent_oracle_centerline_lengths'])
@@ -264,8 +383,14 @@ class ArgoverseDataset(Dataset):
         example['num_social_agents'] = num_social_agents
 
         # Create adjacency matrix
-        adjacency = np.zeros((self.timesteps, num_social_agents+1, num_social_agents+1))
-        label_adjacency = np.zeros((self.outsteps, num_social_agents+1, num_social_agents+1))
+        if (self.variable_length_training or self.variable_scenario_training or self.renormalize):
+            adjacency = np.zeros((curr_length, num_social_agents+1, num_social_agents+1))
+        else:
+            adjacency = np.zeros((self.timesteps, num_social_agents+1, num_social_agents+1))
+        if self.variable_scenario_training:
+            label_adjacency = np.zeros((self.timesteps + self.outsteps - curr_length, num_social_agents+1, num_social_agents+1))
+        else:
+            label_adjacency = np.zeros((self.outsteps, num_social_agents+1, num_social_agents+1))
 
         # Focal agent is always present
         # Remove self loop
@@ -273,6 +398,7 @@ class ArgoverseDataset(Dataset):
         label_adjacency[:, 0, :] = 1
         for social_agent, input_mask in enumerate(example['social_input_mask']):
             adjacency[input_mask, social_agent + 1, :] = 1
+            
         for social_agent, input_mask in enumerate(example['social_label_mask']):
             label_adjacency[input_mask, social_agent + 1, :] = 1
         indexer = np.arange(num_social_agents + 1)
@@ -318,16 +444,25 @@ class ArgoverseDataset(Dataset):
 
         ifc_helpers['rotation'] = example['rotation']
         ifc_helpers['translation'] = example['translation']
+        if self.variable_scenario_training:
+            ifc_helpers['outsteps'] = self.timesteps + self.outsteps - curr_length
+        else:
+            ifc_helpers['outsteps'] = self.outsteps
+
+        try:
+            ifc_helpers['rotation'] = feature_helpers['ROTATION']
+            ifc_helpers['translation'] = feature_helpers['TRANSLATION']
+        except:
+            pass
+        
         ifc_helpers['city'] = example['city']
         ifc_helpers['idx'] = example['seq_id']
         ifc_helpers['agent_input_mask'] = example['agent_input_mask']
         ifc_helpers['social_input_mask'] = example['social_input_mask']
         ifc_helpers['agent_label_mask'] = example['agent_label_mask']
-
         if self.delta:
             ifc_helpers['agent_xy_delta'] = example['agent_xy_ref_end'].astype(np.float32)
             ifc_helpers['social_xy_delta'] = example['social_xy_ref_end'].astype(np.float32)
-
         input_dict = {'agent_features': agent_features,
                       'ifc_helpers': ifc_helpers,
                       'social_features': social_features,
@@ -339,7 +474,8 @@ class ArgoverseDataset(Dataset):
 
         if self.mode != 'test_nolabel':
             target_dict = {'agent_labels': agent_labels,
-                        #    'agent_xy_ref_end': ifc_helpers['agent_xy_delta'] if self.delta else None,
+                            'agent_labels_nodelta': example['agent_xy_labels'],
+                           'agent_xy_ref_end': ifc_helpers['agent_xy_delta'] if self.delta else None,
                         #    'social_labels': social_labels,
                         #    'social_label_mask': social_label_mask.astype(np.float32),
                         #    'idx': example['seq_id']
@@ -347,6 +483,48 @@ class ArgoverseDataset(Dataset):
             return input_dict, target_dict
         else:
             return input_dict, None
+
+    def normalize_xy(self, xy_locations, translation=None, rotation=None, to_rotate=True, renormalize=False):
+        """
+        Translate and rotate the input data so that the first timestep is (0,0) and the last
+        timestep lies on the positive x axis.
+            Args:
+                xy_locations (numpy array): XY positions for the trajectory
+            Returns:
+                xy_locations_normalized (numpy array): normalized XY positions
+                feature_helpers (dict): Dictionary that stores the rotations and translations
+                    applied to the trajectory
+        """
+        # Apply translation
+        if xy_locations.shape[0] > 1:
+            trajectory = LineString(xy_locations)
+            if translation is None:
+                if not renormalize:
+                    translation = [-xy_locations[0, 0], -xy_locations[0, 1]]
+                else:
+                    translation = [-xy_locations[-1, 0], -xy_locations[-1, 1]]
+            mat = [1, 0, 0, 1, translation[0], translation[1]]
+            trajectory_translated = affine_transform(trajectory, mat)
+
+            # Apply rotation
+            if to_rotate:
+                if rotation is None:
+                    rotation = -np.degrees(np.arctan2(trajectory_translated.coords[-1][1],
+                                           trajectory_translated.coords[-1][0]))
+
+                trajectory_rotated = np.array(rotate(trajectory_translated, rotation,
+                                              origin=(0, 0)).coords)
+                return trajectory_rotated, {'TRANSLATION': translation, 'ROTATION': rotation}
+            else:
+                return np.array(trajectory_translated.coords), {'TRANSLATION': translation, 'ROTATION': None}
+        else:
+            if translation is None:
+                return np.zeros_like(xy_locations, dtype=np.float), \
+                       {'TRANSLATION': [-xy_locations[0, 0], -xy_locations[0, 1]], 'ROTATION': None}
+            else:
+                return np.array([[xy_locations[0, 0]+translation[0],
+                                 xy_locations[0, 0]+translation[1]]]), \
+                       {'TRANSLATION': translation, 'ROTATION': None}
 
     def denormalize_xy(self, xy_locations, translation=None, rotation=None):
         """Reverse the Translate and rotate operations on the input data
@@ -381,8 +559,11 @@ class ArgoverseDataset(Dataset):
         trajectory_translated = affine_transform(trajectory, mat)
 
         # Apply rotation
-        trajectory_rotated = np.array(rotate(trajectory_translated, rotation, origin=(0, 0)).coords, dtype=np.float32)
-        return trajectory_rotated
+        if rotation is not None:
+            trajectory_rotated = np.array(rotate(trajectory_translated, rotation, origin=(0, 0)).coords, dtype=np.float32)
+            return trajectory_rotated
+        else:
+            return np.array(trajectory_translated.coords)
 
     def relative_distance_with_labels(self, input, labels):
         """Compute relative distance from absolute
@@ -453,10 +634,41 @@ class ArgoverseDataset(Dataset):
                                 num_pad = max_actors - elem.size(1) + 1
                                 padded_elem = torch.nn.functional.pad(elem, (0, num_pad, 0, num_pad, 0, 0))
                             value[index] = padded_elem
-                        batch_dict[key] = torch.stack(value)
+                        try:
+                            batch_dict[key] = torch.stack(value)
+                        except:
+                            if key == 'social_input_mask' or key == 'social_features':
+                                max_pad = np.max([x.size(1) for x in value])
+                                for index, elem in enumerate(value):
+                                    num_pad = max_pad - elem.size(1)
+                                    if len(elem.size()) == 2:
+                                        padded_elem = torch.nn.functional.pad(elem, (num_pad, 0), value=0.)
+                                    elif len(elem.size()) == 3:
+                                        padded_elem = torch.nn.functional.pad(elem, (0, 0, num_pad, 0), value=0.)
+                                    value[index] = padded_elem    
+                            if key == 'social_label_mask' or key == 'social_label_features':
+                                max_pad = np.max([x.size(1) for x in value])
+                                for index, elem in enumerate(value):
+                                    num_pad = max_pad - elem.size(1)
+                                    if len(elem.size()) == 2:
+                                        padded_elem = torch.nn.functional.pad(elem, (0, num_pad), value=0.)
+                                    elif len(elem.size()) == 3:
+                                        padded_elem = torch.nn.functional.pad(elem, (0, 0, 0, num_pad), value=0.)
+                                    value[index] = padded_elem    
+                            if key == 'adjacency' or key == 'label_adjacency':
+                                max_pad = np.max([x.size(0) for x in value])
+                                for index, elem in enumerate(value):
+                                    num_pad = max_pad - elem.size(0)
+                                    padded_elem = torch.nn.functional.pad(elem, (0, 0, 0, 0, num_pad, 0), value=0.)
+                                    value[index] = padded_elem    
+                            try:
+                                batch_dict[key] = torch.stack(value)
+                            except:
+                                import ipdb; ipdb.set_trace()
+                                a= 1
                     else:
                         try:
-                            if ('centerline' in key and 'lengths' not in key) or ('mask' in key):
+                            if ('centerline' in key and 'lengths' not in key) or (key == 'num_agent_mask'):
                                 max_pad = np.max([x.size(0) for x in value])
                                 for index, elem in enumerate(value):
                                     num_pad = max_pad - elem.size(0)
@@ -467,8 +679,29 @@ class ArgoverseDataset(Dataset):
                                     else:
                                         padded_elem = torch.nn.functional.pad(elem, (0, 0, 0, num_pad), value=0.)
                                     value[index] = padded_elem
-                            batch_dict[key] = torch.stack(value)
+                            
+                            if isinstance(value, list):
+                                if key == 'agent_features' or key == 'agent_input_mask':
+                                    max_pad = np.max([x.size(0) for x in value])
+                                    for index, elem in enumerate(value):
+                                        num_pad = max_pad - elem.size(0)
+                                        if len(elem.size()) == 2:
+                                            padded_elem = torch.nn.functional.pad(elem, (0, 0, num_pad, 0), value=0.)
+                                        elif len(elem.size()) == 1:
+                                            padded_elem = torch.nn.functional.pad(elem, (num_pad, 0), value=0.)
+                                        value[index] = padded_elem                     
+                                if key == 'agent_label_mask' or key == 'agent_labels':
+                                    max_pad = np.max([x.size(0) for x in value])
+                                    for index, elem in enumerate(value):
+                                        num_pad = max_pad - elem.size(0)
+                                        if len(elem.size()) == 2:
+                                            padded_elem = torch.nn.functional.pad(elem, (0, 0, 0, num_pad), value=0.)
+                                        elif len(elem.size()) == 1:
+                                            padded_elem = torch.nn.functional.pad(elem, (0, num_pad), value=0.)
+                                        value[index] = padded_elem 
+                                batch_dict[key] = torch.stack(value)
                         except:
+                            import ipdb; ipdb.set_trace()
                             if 'centerline' in key and 'lengths' not in key:
                                 max_pad = np.max([x.size(1) for x in value])
                                 for index, elem in enumerate(value):

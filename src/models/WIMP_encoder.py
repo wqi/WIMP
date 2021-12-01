@@ -186,3 +186,58 @@ class WIMPEncoder(nn.Module):
     def initHidden(self, batch_size=1, num_agents=1):
         weight = next(self.parameters()).data
         return (weight.new(batch_size, num_agents, self.hparams.hidden_dim).zero_(), weight.new(batch_size, num_agents, self.hparams.hidden_dim).zero_())
+
+class LSTMEncoder(nn.Module):
+    def __init__(self, hparams):
+        super(LSTMEncoder, self).__init__()
+        self.hparams = hparams
+        self.hparams.cl_kernel_list = [1, 3, 5]
+        self.hparams.xy_kernel_list = [1, 3, 5]
+        self.xy_input_transform = nn.Conv1d(in_channels=self.hparams.input_dim,
+                                            out_channels=self.hparams.hidden_dim, kernel_size=1)
+        self.non_linearity = nn.Tanh() if self.hparams.non_linearity == 'tanh' else nn.ReLU()
+        self.lstm = nn.LSTM(input_size=self.hparams.hidden_dim, hidden_size=self.hparams.hidden_dim,
+                            num_layers=self.hparams.num_layers, batch_first=True,
+                            dropout=self.hparams.dropout)
+        if self.hparams.learnable_hidden_state:
+            weight = next(self.parameters()).data
+            self.h0 = nn.Parameter(weight.new(self.hparams.num_layers, self.hparams.hidden_dim).zero_().float(), requires_grad=True)
+            self.c0 = nn.Parameter(weight.new(self.hparams.num_layers, self.hparams.hidden_dim).zero_().float(), requires_grad=True)
+            nn.init.xavier_uniform_(self.h0)
+            nn.init.xavier_uniform_(self.c0)
+
+        if self.hparams.batch_norm:
+            self.input_bn = nn.BatchNorm1d(self.hparams.hidden_dim)
+
+    def forward(self, agent_features, social_features, num_agent_mask, adjacency, ifc_helpers=None, visualize_centerline=False):
+        if self.hparams.distributed_backend == 'dp':
+            self.lstm.flatten_parameters()
+        
+        all_agents = agent_features.unsqueeze(1).view(-1, *agent_features.size()[1:])
+        all_input_mask = ifc_helpers['agent_input_mask'].unsqueeze(1).view(-1, *ifc_helpers['agent_input_mask'].size()[1:])
+        all_agents_nonzero_transposed = all_agents.transpose(1,2).contiguous()
+        
+        # Compute convolution filters and encoding
+        input_features = self.non_linearity(self.xy_input_transform(all_agents_nonzero_transposed))
+        input_features = input_features.transpose(1,2).contiguous()
+        if self.hparams.batch_norm:
+            input_features = self.input_bn(input_features.transpose(1,2).contiguous()).transpose(1,2).contiguous()
+        # Initialize Hidden State
+        hidden = self.initHidden(self.hparams.num_layers, input_features.size(0))
+        for tstep in range(input_features.size(1)):
+            current_input_xy_centerline = input_features.narrow(1, start=tstep, length=1)
+            current_encoding, hidden = self.lstm(current_input_xy_centerline, hidden)
+
+        # Pad zeros for dummy agents
+        return current_encoding, hidden, []
+
+    def initHidden(self, batch_size=1, num_agents=1):
+        weight = next(self.parameters()).data
+        if self.hparams.random_hidden_state:
+            return (weight.new(batch_size, num_agents, self.hparams.hidden_dim).normal_(), weight.new(batch_size, num_agents, self.hparams.hidden_dim).normal_())
+        elif self.hparams.learnable_hidden_state:
+            h0 = self.h0.unsqueeze(1).repeat(1, num_agents, 1)
+            c0 = self.c0.unsqueeze(1).repeat(1, num_agents, 1)
+            return (h0, c0)
+        else:
+            return (weight.new(batch_size, num_agents, self.hparams.hidden_dim).zero_(), weight.new(batch_size, num_agents, self.hparams.hidden_dim).zero_())

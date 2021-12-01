@@ -490,7 +490,7 @@ def compute_features(path, xy_features_flag=True, xy_features_normalize_flag=Tru
     xy_locations = agent_track[['X', 'Y']].values
     agent_features = {}
 
-    agent_tstamps = np.arange(timesteps)
+    agent_tstamps = np.arange(xy_locations.shape[0])
     agent_tsteps = np.sum(agent_tstamps < timesteps)
     agent_features = {}
     map_json = None

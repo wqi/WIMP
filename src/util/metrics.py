@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-def compute_metrics(preds, truth, mode='mean', aggregation='agent', miss_threshold=2.0, mask=None):
+def compute_metrics(preds, truth, mode='mean', aggregation='agent', miss_threshold=2.0, mask=None, return_per_scenario=False):
     """Compute the required evaluation metrics: ADE, FDE, and MR
         Args:
             preds (tensor) [n, a, m, l, d]: predicted trajectories
@@ -35,7 +35,7 @@ def compute_metrics(preds, truth, mode='mean', aggregation='agent', miss_thresho
     fde = torch.gather(fde_all, -1, min_fde_idx).squeeze(-1)
     ade = torch.gather(ade_all, -1, min_fde_idx).squeeze(-1)
     miss = (fde > miss_threshold).float()
-
+    per_scenario_metrics = []
     # Aggregate metrics across agents or scenarios
     if aggregation == 'scenario':
         import ipdb; ipdb.set_trace()
@@ -51,11 +51,14 @@ def compute_metrics(preds, truth, mode='mean', aggregation='agent', miss_thresho
             ade = torch.mean(wc_ade)
             mr = torch.mean((wc_fde > miss_threshold).float())  # Reported per-scenario
     elif aggregation == 'agent':
+        
+        if return_per_scenario:
+            per_scenario_metrics = [fde[:].data.cpu().numpy(), ade[:].data.cpu().numpy(), miss[:].data.cpu().numpy()]
         fde = torch.sum(fde) / num_agent_mask.sum()
         ade = torch.sum(ade) / num_agent_mask.sum()
         mr = torch.sum(miss) / num_agent_mask.sum()
 
-    return (ade, fde, mr)
+    return (ade, fde, mr, per_scenario_metrics)
 
 def compute_metrics_1(prediction, truth, mean=True, on_gpu=True, miss_threshold=2.0):
     """Compute the required evaluation metrics: ADE, FDE, and MR
